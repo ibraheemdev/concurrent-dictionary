@@ -340,20 +340,7 @@ where
         }
     }
 
-    /// Clears the map, removing all key-value pairs.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use flurry::HashMap;
-    ///
-    /// let map = HashMap::new();
-    ///
-    /// map.pin().insert(1, "a");
-    /// map.pin().clear();
-    /// assert!(map.pin().is_empty());
-    /// ```
-    fn clear(&self, guard: &Guard) {
+    pub(crate) fn clear(&self, guard: &Guard) {
         let _guard = self.lock_all(guard);
 
         let tables_ptr = self.tables.load(Ordering::Acquire, guard);

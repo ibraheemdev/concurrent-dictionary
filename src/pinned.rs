@@ -124,6 +124,23 @@ where
         self.map.insert(key, value, &self.guard)
     }
 
+    /// Clears the map, removing all key-value pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flurry::HashMap;
+    ///
+    /// let map = HashMap::new();
+    ///
+    /// map.pin().insert(1, "a");
+    /// map.pin().clear();
+    /// assert!(map.pin().is_empty());
+    /// ```
+    pub fn clear(&self) {
+        self.map.clear(&self.guard)
+    }
+
     /// Returns the number of elements in the map.
     ///
     /// # Examples
