@@ -1,4 +1,3 @@
-#![allow(dead_code, unused)]
 #![deny(rust_2018_idioms, clippy::all)]
 
 mod pinned;

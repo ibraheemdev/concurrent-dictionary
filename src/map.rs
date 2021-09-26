@@ -1,10 +1,8 @@
-use crate::atomic_array::{AtomicArray, AtomicArrayBuilder};
 use crate::Pinned;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
@@ -33,7 +31,6 @@ pub struct HashMap<K, V, S = RandomState> {
 struct Tables<K, V> {
     buckets: Box<[Atomic<Node<K, V>>]>,
     locks: Arc<[Arc<Mutex<()>>]>,
-    count_per_locks: AtomicArray<AtomicUsize>,
 }
 
 struct Node<K, V> {
@@ -128,7 +125,6 @@ where
                 .take(num_cpus)
                 .collect::<Vec<_>>()
                 .into(),
-            count_per_locks: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), num_cpus).build(),
         };
 
         Self {
@@ -228,13 +224,9 @@ where
 
                 node.store(Owned::new(new), Ordering::Release);
 
-                self.len.fetch_add(1, Ordering::SeqCst);
-                let count = unsafe {
-                    tables.count_per_locks.load_ref(Ordering::Acquire, guard)[lock_index as usize]
-                        .fetch_add(1, Ordering::SeqCst)
-                };
+                let len = self.len.fetch_add(1, Ordering::SeqCst);
 
-                if count + 1 > self.budget.load(Ordering::SeqCst) {
+                if len + 1 > self.budget.load(Ordering::SeqCst) {
                     should_resize = true;
                 }
             }
@@ -330,12 +322,6 @@ where
 
                         self.len.fetch_min(1, Ordering::SeqCst);
 
-                        unsafe {
-                            tables.count_per_locks.load_ref(Ordering::Acquire, guard)
-                                [lock_index as usize]
-                                .fetch_min(1, Ordering::SeqCst);
-                        }
-
                         let val = unsafe { node.value.as_ref() };
 
                         unsafe {
@@ -368,8 +354,6 @@ where
     /// assert!(map.pin().is_empty());
     /// ```
     fn clear(&self, guard: &Guard) {
-        let locks_acquired = 0;
-
         let _guard = self.lock_all(guard);
 
         let tables_ptr = self.tables.load(Ordering::Acquire, guard);
@@ -381,11 +365,6 @@ where
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             locks: tables.locks.clone(),
-            count_per_locks: AtomicArrayBuilder::from_fn(
-                || AtomicUsize::new(0),
-                tables.locks.len(),
-            )
-            .build(),
         };
 
         let new_budget = new_tables.buckets.len() / new_tables.locks.len();
@@ -441,8 +420,6 @@ where
     fn grow_table<'g>(&'g self, tables_ptr: Shared<'g, Tables<K, V>>, guard: &'g Guard) {
         const MAX_ARRAY_LENGTH: usize = isize::MAX as _;
         const MAX_LOCKS: usize = 1024;
-
-        let locks_acquired = 0;
 
         let tables = unsafe { tables_ptr.deref() };
 
@@ -505,10 +482,12 @@ where
         let _guard_rest = self.lock_range(1..tables.locks.len(), guard);
 
         let mut new_locks = None;
+        let mut new_locks_len = tables.locks.len();
 
         // add more locks
         if tables.locks.len() < MAX_LOCKS {
-            let mut locks = Vec::with_capacity(tables.locks.len() * 2);
+            new_locks_len = tables.locks.len() * 2;
+            let mut locks = Vec::with_capacity(new_locks_len);
 
             for i in 0..tables.locks.len() {
                 locks.push(tables.locks[i].clone());
@@ -521,14 +500,6 @@ where
             new_locks = Some(locks);
         }
 
-        let mut new_count_per_locks = AtomicArrayBuilder::from_fn(
-            || AtomicUsize::new(0),
-            new_locks
-                .as_ref()
-                .map(|x| x.capacity())
-                .unwrap_or(tables.locks.len()),
-        );
-
         let mut new_buckets = std::iter::repeat_with(|| Atomic::null())
             .take(new_len)
             .collect::<Vec<_>>();
@@ -540,7 +511,6 @@ where
                 let next = unsafe { node.next.load(Ordering::Acquire, guard).as_ref() };
 
                 let new_bucket_index = bucket_index(node.hash, new_buckets.capacity() as _);
-                let new_lock_index = lock_index(new_bucket_index, tables.locks.len() as _);
 
                 new_buckets[new_bucket_index as usize] = Atomic::new(Node {
                     key: node.key.clone(),
@@ -549,15 +519,12 @@ where
                     hash: node.hash,
                 });
 
-                new_count_per_locks.as_ref()[new_lock_index as usize]
-                    .fetch_add(1, Ordering::Relaxed);
-
                 current = next;
             }
         }
 
         self.budget.store(
-            1.max(new_buckets.capacity() / new_count_per_locks.len()),
+            1.max(new_buckets.capacity() / new_locks_len),
             Ordering::SeqCst,
         );
 
@@ -567,7 +534,6 @@ where
                 locks: new_locks
                     .map(Arc::from)
                     .unwrap_or_else(|| tables.locks.clone()),
-                count_per_locks: new_count_per_locks.build(),
             }),
             Ordering::Release,
         );
