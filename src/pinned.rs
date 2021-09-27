@@ -1,4 +1,5 @@
-use crate::HashMap;
+use crate::{HashMap, Iter};
+
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
@@ -21,32 +22,6 @@ where
     K: Hash + Eq + Send + Sync + Clone,
     S: BuildHasher,
 {
-    /// Removes a key from the map, returning the value at the key if the key
-    /// was previously in the map.
-    ///
-    /// The key may be any borrowed form of the map's key type, but
-    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
-    /// the key type.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_dictionary::HashMap;
-    ///
-    /// let map = HashMap::new();
-    /// let pinned = map.pin();
-    ///
-    /// pinned.insert(1, "a");
-    /// assert_eq!(pinned.remove(&1), Some(&"a"));
-    /// assert_eq!(pinned.remove(&1), None);
-    /// ```
-    pub fn remove<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.map.remove(key, &self.guard)
-    }
     /// Returns a reference to the value corresponding to the key.
     ///
     /// The key may be any borrowed form of the map's key type, but
@@ -71,6 +46,27 @@ where
         Q: Hash + Eq,
     {
         self.map.get(key, &self.guard)
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    /// The iterator element type is `(&'a K, &'a V)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_dictionary::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// for (key, val) in map.iter() {
+    ///     println!("key: {} val: {}", key, val);
+    /// }
+    /// ```
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        self.map.iter(&self.guard)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -124,6 +120,33 @@ where
         self.map.insert(key, value, &self.guard)
     }
 
+    /// Removes a key from the map, returning the value at the key if the key
+    /// was previously in the map.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_dictionary::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// let pinned = map.pin();
+    ///
+    /// pinned.insert(1, "a");
+    /// assert_eq!(pinned.remove(&1), Some(&"a"));
+    /// assert_eq!(pinned.remove(&1), None);
+    /// ```
+    pub fn remove<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.map.remove(key, &self.guard)
+    }
+
     /// Clears the map, removing all key-value pairs.
     ///
     /// # Examples
@@ -156,7 +179,7 @@ where
     /// assert_eq!(pinned.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.len(&self.guard)
     }
 
     /// Returns `true` if the map contains no elements.
@@ -174,7 +197,7 @@ where
     /// assert!(!pinned.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty(&self.guard)
     }
 }
 

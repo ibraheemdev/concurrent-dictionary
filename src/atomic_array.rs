@@ -8,7 +8,7 @@ pub(crate) struct AtomicArray<T> {
 }
 
 impl<T> AtomicArray<T> {
-    pub unsafe fn load_ref(&self, ordering: Ordering, guard: &Guard) -> &[T] {
+    pub unsafe fn load(&self, ordering: Ordering, guard: &Guard) -> &[T] {
         let arr: &[MaybeUninit<T>] = self.inner.load(ordering, guard).deref();
         std::mem::transmute(arr)
     }
@@ -32,10 +32,6 @@ impl<T> AtomicArrayBuilder<T> {
     pub fn as_ref(&self) -> &[T] {
         let arr: &[MaybeUninit<T>] = self.inner.as_ref();
         unsafe { std::mem::transmute(arr) }
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.as_ref().len()
     }
 
     pub fn build(self) -> AtomicArray<T> {
