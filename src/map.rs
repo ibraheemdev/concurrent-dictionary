@@ -2,13 +2,13 @@ use crate::Pinned;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
-use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::{fmt, ptr};
 
 use crossbeam_epoch::{Atomic, Collector, Guard, Owned, Shared};
 use lock_api::RawMutex;
@@ -306,25 +306,22 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    fn init_table<'g>(
-        &'g self,
-        capacity: Option<usize>,
-        guard: &'g Guard,
-    ) -> Shared<'g, Table<K, V>> {
+    fn init_table<'g>(&'g self, capacity: Option<usize>, guard: &'g Guard) -> &'g Table<K, V> {
         let _guard = self.resize.lock();
-        let table = self.table.load(Ordering::Acquire, guard);
 
-        if !table.is_null() {
-            return table;
+        match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+            Some(table) => table,
+            None => {
+                let new_table = Owned::new(Table::new(
+                    capacity.unwrap_or(Self::DEFAULT_BUCKETS),
+                    Self::default_locks(),
+                ))
+                .into_shared(guard);
+
+                self.table.store(new_table, Ordering::Release);
+                unsafe { new_table.deref() }
+            }
         }
-
-        let new_table = Owned::new(Table::new(
-            capacity.unwrap_or(Self::DEFAULT_BUCKETS),
-            Self::default_locks(),
-        ))
-        .into_shared(guard);
-        self.table.store(new_table, Ordering::Release);
-        return new_table;
     }
 }
 
@@ -407,13 +404,10 @@ where
         let mut should_resize = false;
 
         loop {
-            let mut table_ptr = self.table.load(Ordering::Acquire, guard);
-
-            if table_ptr.is_null() {
-                table_ptr = self.init_table(None, guard);
-            }
-
-            let table = unsafe { table_ptr.deref() };
+            let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+                Some(table) => table,
+                None => self.init_table(None, guard),
+            };
 
             let bucket_index = bucket_index(hash, table.buckets.len() as _);
             let lock_index = lock_index(bucket_index, table.locks.len() as _);
@@ -422,7 +416,7 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if table_ptr != self.table.load(Ordering::Acquire, guard) {
+                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
                     continue;
                 }
 
@@ -487,6 +481,8 @@ where
             }
 
             // Resize the table if we're passed our budget.
+            //
+            // Note that we are not holding the lock anymore.
             if should_resize {
                 self.resize(table, None, guard);
             }
@@ -505,13 +501,7 @@ where
         let hash = self.hash(key);
 
         loop {
-            let table_ptr = self.table.load(Ordering::Acquire, guard);
-
-            if table_ptr.is_null() {
-                return None;
-            }
-
-            let table = unsafe { table_ptr.deref() };
+            let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
             let bucket_index = bucket_index(hash, table.buckets.len() as _);
             let lock_index = lock_index(bucket_index, table.locks.len() as _);
@@ -520,7 +510,7 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if table_ptr != self.table.load(Ordering::Acquire, guard) {
+                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
                     continue;
                 }
 
@@ -627,7 +617,7 @@ where
         let _guard = self.resize.lock();
 
         // Make sure nobody resized the table while we were waiting for the resize lock.
-        if Shared::from(table as *const _) != self.table.load(Ordering::Acquire, guard) {
+        if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
             // We assume that since the table reference is different, it was
             // already resized (or the budget was adjusted). If we ever decide
             // to do table shrinking, or replace the table for other reasons,

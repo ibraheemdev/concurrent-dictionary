@@ -1,7 +1,18 @@
 [package]
 name = "seize"
-version = "0.1.0"
+version = "0.0.0"
+authors = ["Ibraheem Ahmed <ibrah1440@gmail.com>"]
 edition = "2018"
+license = "MIT"
+
+readme = "README.md"
+description = "A Rust concurrent HashMap optimized for read-heavy workloads"
+repository = "https://github.com/ibraheemdev/seize"
+
+keywords = ["hashmap", "concurrent", "map"]
+categories = ["concurrency", "data-structures"]
+
+exclude = ["/dotnet/**"]
 
 [dependencies]
 crossbeam-epoch = "0.9.5"

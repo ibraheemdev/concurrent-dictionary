@@ -1,5 +1,0 @@
-# Improvements
-
-- Resize lock for lazily initializing table, and not locking bucket 0 until necessary. 
-- Reserve space when initializing from collection.
-- Avoid re-atomically-loading table when locking.
