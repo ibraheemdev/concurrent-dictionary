@@ -73,10 +73,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     }
 }
 
-impl<K, V, S> HashMap<K, V, S>
-where
-    S: BuildHasher,
-{
+impl<K, V, S> HashMap<K, V, S> {
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
     ///
@@ -690,6 +687,22 @@ where
     }
 }
 
+/// Computes the bucket index for a particular key.
+fn bucket_index(hashcode: u64, bucket_count: u64) -> u64 {
+    let bucket_index = (hashcode & 0x7fffffff) % bucket_count;
+    debug_assert!(bucket_index < bucket_count);
+
+    bucket_index
+}
+
+/// Computes the lock index for a particular bucket.
+fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
+    let lock_index = bucket_index % lock_count;
+    debug_assert!(lock_index < lock_count);
+
+    lock_index
+}
+
 /// An iterator over the entries of a `HashMap`.
 ///
 /// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
@@ -827,22 +840,6 @@ impl<K, V> Clone for Values<'_, K, V> {
     }
 }
 
-/// Computes the bucket index for a particular key.
-fn bucket_index(hashcode: u64, bucket_count: u64) -> u64 {
-    let bucket_index = (hashcode & 0x7fffffff) % bucket_count;
-    debug_assert!(bucket_index < bucket_count);
-
-    bucket_index
-}
-
-/// Computes the lock index for a particular bucket.
-fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
-    let lock_index = bucket_index % lock_count;
-    debug_assert!(lock_index < lock_count);
-
-    lock_index
-}
-
 impl<K, V, S> Clone for HashMap<K, V, S>
 where
     K: Sync + Send + Clone + Hash + Eq,
@@ -860,6 +857,15 @@ where
         }
 
         cloned
+    }
+}
+
+impl<K, V, S> Default for HashMap<K, V, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
     }
 }
 
