@@ -3,6 +3,7 @@ use crate::Pinned;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
+use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -151,10 +152,6 @@ impl<K, V, S> HashMap<K, V, S> {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-    fn guard(&self) -> Guard {
-        self.collector.register().pin()
-    }
-
     /// Returns a reference to the map pinned to the current thread.
     ///
     /// The only way to access a map is through a pinned reference, which,
@@ -162,7 +159,7 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn pin(&self) -> Pinned<'_, K, V, S> {
         Pinned {
             map: self,
-            guard: self.guard(),
+            guard: self.collector.register().pin(),
         }
     }
 
@@ -681,13 +678,11 @@ where
             }
         }
 
-        // Update the budget.
         self.budget.store(
             1.max(new_buckets.capacity() / new_locks_len),
             Ordering::SeqCst,
         );
 
-        // Replace `self.table` with the updated version atomically.
         self.table.store(
             Owned::new(Table {
                 buckets: new_buckets.into_boxed_slice(),
@@ -790,6 +785,16 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
     }
 }
 
+impl<K, V> fmt::Debug for Iter<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.clone()).finish()
+    }
+}
+
 impl<K, V> Clone for Iter<'_, K, V> {
     fn clone(&self) -> Self {
         Self {
@@ -830,6 +835,16 @@ impl<'g, K, V> Iterator for Keys<'g, K, V> {
     }
 }
 
+impl<K, V> fmt::Debug for Keys<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
 impl<K, V> Clone for Keys<'_, K, V> {
     fn clone(&self) -> Self {
         Self {
@@ -866,6 +881,16 @@ impl<'g, K, V> Iterator for Values<'g, K, V> {
     }
 }
 
+impl<K, V> fmt::Debug for Values<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
 impl<K, V> Clone for Values<'_, K, V> {
     fn clone(&self) -> Self {
         Self {
@@ -894,6 +919,17 @@ where
     }
 }
 
+impl<K, V, S> fmt::Debug for HashMap<K, V, S>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guard = self.collector.register().pin();
+        f.debug_map().entries(self.iter(&guard)).finish()
+    }
+}
+
 impl<K, V, S> Default for HashMap<K, V, S>
 where
     S: Default,
@@ -909,13 +945,13 @@ where
     V: PartialEq,
     S: BuildHasher,
 {
-    pub(crate) fn eq_pinned(this: &Pinned<'_, K, V, S>, other: &Pinned<'_, K, V, S>) -> bool {
-        if this.len() != other.len() {
+    pub(crate) fn eq(&self, guard: &Guard, other: &Self, other_guard: &Guard) -> bool {
+        if self.len(guard) != other.len(other_guard) {
             return false;
         }
 
-        this.iter()
-            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
+        self.iter(guard)
+            .all(|(key, value)| other.get(key, other_guard).map_or(false, |v| *value == *v))
     }
 }
 
@@ -926,7 +962,10 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.pin() == other.pin()
+        let guard = self.collector.register().pin();
+        let other_guard = other.collector.register().pin();
+
+        Self::eq(self, &guard, other, &other_guard)
     }
 }
 

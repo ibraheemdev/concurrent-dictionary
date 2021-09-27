@@ -2,6 +2,7 @@ use crate::{HashMap, Iter, Keys, Values};
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Index;
 
@@ -250,12 +251,6 @@ where
     }
 }
 
-impl<K, V, S> Clone for Pinned<'_, K, V, S> {
-    fn clone(&self) -> Self {
-        self.map.pin()
-    }
-}
-
 impl<K, Q, V, S> Index<&'_ Q> for Pinned<'_, K, V, S>
 where
     K: Borrow<Q> + Hash + Eq,
@@ -269,6 +264,31 @@ where
     }
 }
 
+impl<'map, K, V, S> IntoIterator for &'map Pinned<'_, K, V, S> {
+    type Item = (&'map K, &'map V);
+    type IntoIter = Iter<'map, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K, V, S> Clone for Pinned<'_, K, V, S> {
+    fn clone(&self) -> Self {
+        self.map.pin()
+    }
+}
+
+impl<K, V, S> fmt::Debug for Pinned<'_, K, V, S>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self).finish()
+    }
+}
+
 impl<K, V, S> PartialEq for Pinned<'_, K, V, S>
 where
     K: Eq + Hash,
@@ -276,7 +296,7 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        HashMap::eq_pinned(&self, &other)
+        HashMap::eq(&self.map, &self.guard, &other.map, &other.guard)
     }
 }
 
