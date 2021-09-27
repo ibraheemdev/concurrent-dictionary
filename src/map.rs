@@ -721,6 +721,22 @@ fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
     lock_index
 }
 
+unsafe impl<K, V, S> Send for HashMap<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Send,
+{
+}
+
+unsafe impl<K, V, S> Sync for HashMap<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Sync,
+{
+}
+
 /// An iterator over the entries of a `HashMap`.
 ///
 /// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
