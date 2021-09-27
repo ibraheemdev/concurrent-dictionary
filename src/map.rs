@@ -566,26 +566,13 @@ where
             None => return,
         };
 
-        let new_table = Table {
-            buckets: vec![].into_boxed_slice(),
-            locks: table.locks.clone(),
-            counts: std::iter::from_fn(Default::default)
-                .take(table.locks.len())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        };
-
-        let new_budget = new_table.buckets.len() / new_table.locks.len();
-
-        self.table.store(Owned::new(new_table), Ordering::Release);
-        self.budget.store(1.max(new_budget), Ordering::SeqCst);
-
         // walk through the table buckets, and set each initial node to null, destroying the rest
         // of the nodes and values.
         for i in 0..table.len() {
-            let node_ptr = table.buckets.get(i).unwrap();
+            let node_ptr = &table.buckets[i];
             let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
 
+            // if the node is already null we don't have to do anything
             if let Some(node) = node {
                 node_ptr.store(Shared::null(), Ordering::Release);
 
@@ -602,9 +589,12 @@ where
 
                     next = &node.next;
                 }
-            } else {
-                // the node was already null, and we don't have to do anything
             }
+        }
+
+        // reset the counts
+        for i in 0..table.counts.len() {
+            table.counts[i].store(0, Ordering::Release);
         }
     }
 
@@ -737,11 +727,9 @@ where
 
         // Copy all data into a new buckets, creating new nodes for all elements.
         for i in 0..table.buckets.len() {
-            let mut current = unsafe { table.buckets[i].load(Ordering::Acquire, guard).as_ref() };
+            let mut current = &table.buckets[i];
 
-            while let Some(node) = current {
-                let next = unsafe { node.next.load(Ordering::Acquire, guard).as_ref() };
-
+            while let Some(node) = unsafe { current.load(Ordering::Acquire, guard).as_ref() } {
                 let new_bucket_index = bucket_index(node.hash, new_len as _);
                 let new_lock_index = lock_index(new_bucket_index, new_locks_len as _);
 
@@ -754,7 +742,11 @@ where
 
                 new_counts[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
 
-                current = next;
+                unsafe {
+                    guard.defer_destroy(Shared::from(node as *const _));
+                }
+
+                current = &node.next;
             }
         }
 
