@@ -82,12 +82,12 @@ impl<K, V> Table<K, V> {
         }
 
         /// Unlocks the specified locks on drop.
-        struct Unlock<'g, K, V> {
+        struct Guard<'g, K, V> {
             table: &'g Table<K, V>,
             range: Range<usize>,
         }
 
-        impl<K, V> Drop for Unlock<'_, K, V> {
+        impl<K, V> Drop for Guard<'_, K, V> {
             fn drop(&mut self) {
                 for i in self.range.clone() {
                     unsafe {
@@ -97,7 +97,7 @@ impl<K, V> Table<K, V> {
             }
         }
 
-        Unlock { table: self, range }
+        Guard { table: self, range }
     }
 }
 
@@ -154,7 +154,7 @@ impl<K, V, S> HashMap<K, V, S> {
     const MAX_BUCKETS: usize = isize::MAX as _;
 
     /// The hash-table will be resized to this amount on the first insert
-    /// unless an alternative capacity is specified.
+    /// unless a non-zero capacity is specified upon creation.
     const DEFAULT_BUCKETS: usize = 31;
 
     /// The maximum size of the `locks` array.
@@ -228,7 +228,8 @@ impl<K, V, S> HashMap<K, V, S> {
             return Self::with_hasher(hash_builder);
         }
 
-        let lock_count = capacity.checked_div(4).unwrap_or_else(num_cpus::get);
+        // TODO: calculate lock count from capacity here and in `init_table`
+        let lock_count = Self::default_locks();
 
         Self {
             resize: Arc::new(Mutex::new(())),
@@ -319,7 +320,6 @@ impl<K, V, S> HashMap<K, V, S> {
 
         let new_table = Owned::new(Table::new(
             capacity.unwrap_or(Self::DEFAULT_BUCKETS),
-            // TODO: calculate locks from cap
             Self::default_locks(),
         ))
         .into_shared(guard);
@@ -479,19 +479,14 @@ where
                 // If the number of elements guarded by this lock has exceeded the budget, resize
                 // the hash table.
                 //
-                // It is also possible that GrowTable will increase the budget but won't resize the
-                // hash table, if it is being poorly utilized due to a bad hash function.
+                // It is also possible that `resize` will increase the budget instead of resizing the
+                // hashtable if keys are poorly distributed across buckets.
                 if count > self.budget.load(Ordering::SeqCst) {
                     should_resize = true;
                 }
             }
 
-            // We just performed an insertion. If necessary, we will resize the buckets.
-            // Notice that we are not holding any locks when calling resize.
-            // This is necessary to prevent deadlocks. As a result, it is possible that
-            // resize will be called unnecessarily, but, it will obtain the resize lock and
-            // then verify that the table we passed to it as the argument is still the
-            // current table.
+            // Resize the table if we're passed our budget.
             if should_resize {
                 self.resize(table, None, guard);
             }
@@ -563,60 +558,52 @@ where
 
     /// Clears the map, removing all key-value pairs.
     pub(crate) fn clear(&self, guard: &Guard) {
-        loop {
-            let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
-                Some(table) => table,
-                None => return,
-            };
+        // TODO: acquire each lock and destroy the buckets guarded by it
+        // sequentially instead of all at once
+        let (table, _guard) = match self.lock_all(guard) {
+            Some(x) => x,
+            // the table was null
+            None => return,
+        };
 
-            // TODO: acquire each lock and destroy the buckets guarded by it
-            // sequentially instead of all at once
-            let _guard = self.lock_all(table);
+        let new_table = Table {
+            buckets: vec![].into_boxed_slice(),
+            locks: table.locks.clone(),
+            counts: std::iter::from_fn(Default::default)
+                .take(table.locks.len())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
 
-            // Make sure the table didn't change while we were waiting for the lock.
-            if Shared::from(table as *const _) != self.table.load(Ordering::Acquire, guard) {
-                continue;
-            }
+        let new_budget = new_table.buckets.len() / new_table.locks.len();
 
-            let new_table = Table {
-                buckets: vec![].into_boxed_slice(),
-                locks: table.locks.clone(),
-                counts: std::iter::from_fn(Default::default)
-                    .take(table.locks.len())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            };
+        self.table.store(Owned::new(new_table), Ordering::Release);
+        self.budget.store(1.max(new_budget), Ordering::SeqCst);
 
-            let new_budget = new_table.buckets.len() / new_table.locks.len();
+        // walk through the table buckets, and set each initial node to null, destroying the rest
+        // of the nodes and values.
+        for i in 0..table.len() {
+            let node_ptr = table.buckets.get(i).unwrap();
+            let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
 
-            self.table.store(Owned::new(new_table), Ordering::Release);
-            self.budget.store(1.max(new_budget), Ordering::SeqCst);
+            if let Some(node) = node {
+                node_ptr.store(Shared::null(), Ordering::Release);
 
-            // walk through the table buckets, and set each initial node to null, destroying the rest
-            // of the nodes and values.
-            for i in 0..table.len() {
-                let node_ptr = table.buckets.get(i).unwrap();
-                let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
+                unsafe {
+                    guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
+                }
 
-                if let Some(node) = node {
-                    node_ptr.store(Shared::null(), Ordering::Release);
-
+                let mut next = &node.next;
+                while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
                     unsafe {
+                        guard.defer_destroy(Shared::from(node as *const _));
                         guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
                     }
 
-                    let mut next = &node.next;
-                    while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
-                        unsafe {
-                            guard.defer_destroy(Shared::from(node as *const _));
-                            guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
-                        }
-
-                        next = &node.next;
-                    }
-                } else {
-                    // the node was already null, and we don't have to do anything
+                    next = &node.next;
                 }
+            } else {
+                // the node was already null, and we don't have to do anything
             }
         }
     }
@@ -791,15 +778,22 @@ where
     }
 
     /// Acquires all locks for this table.
-    fn lock_all<'g>(&'g self, table: &'g Table<K, V>) -> (impl Drop + 'g, impl Drop + 'g) {
+    fn lock_all<'g>(&'g self, guard: &'g Guard) -> Option<(&'g Table<K, V>, impl Drop + 'g)> {
         // Acquire the resize lock.
         let _guard = self.resize.lock();
 
-        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
-        // and so we can safely read locks.len().
+        // Now that we have the resize lock, we can safely load the table and acquire it's
+        // locks, knowing that it cannot change.
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
         let _guard_rest = table.lock_range(0..table.locks.len());
 
-        (_guard, _guard_rest)
+        struct Guard<A, B>(A, B);
+
+        impl<A, B> Drop for Guard<A, B> {
+            fn drop(&mut self) {}
+        }
+
+        Some((table, Guard(_guard, _guard_rest)))
     }
 }
 
