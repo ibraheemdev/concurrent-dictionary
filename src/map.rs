@@ -62,7 +62,7 @@ impl<K, V> Table<K, V> {
     }
 
     /// Acquires all locks for this hash bucket.
-    fn lock_all<'g>(&'g self) -> (impl Drop + 'g, impl Drop + 'g) {
+    fn lock_all(&self) -> (impl Drop + '_, impl Drop + '_) {
         // Acquire the first lock.
         let _guard = self.lock_range(0..1);
 
@@ -74,7 +74,7 @@ impl<K, V> Table<K, V> {
     }
 
     /// Acquires a contiguous range of locks for this hash bucket.
-    fn lock_range<'g>(&'g self, range: Range<usize>) -> impl Drop + 'g {
+    fn lock_range(&self, range: Range<usize>) -> impl Drop + '_ {
         for i in range.clone() {
             unsafe {
                 self.locks[i].raw().lock();
@@ -98,6 +98,13 @@ impl<K, V> Table<K, V> {
         }
 
         Unlock { table: self, range }
+    }
+
+    fn len(&self, guard: &Guard) -> usize {
+        // TODO: is this too slow? should we store a cached total length?
+        unsafe { self.count_per_lock.load(Ordering::Acquire, guard) }
+            .iter()
+            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
     }
 }
 
@@ -239,12 +246,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
 
         match table {
-            Some(table) => {
-                // TODO: is this too slow? should we store a cached total length?
-                unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
-                    .iter()
-                    .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
-            }
+            Some(table) => table.len(guard),
             None => 0,
         }
     }
@@ -282,7 +284,11 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    fn init_table<'g>(&'g self, guard: &'g Guard) -> Shared<'g, Table<K, V>> {
+    fn init_table<'g>(
+        &'g self,
+        capacity: Option<usize>,
+        guard: &'g Guard,
+    ) -> Shared<'g, Table<K, V>> {
         let _guard = self.resize.lock();
         let table = self.table.load(Ordering::Acquire, guard);
 
@@ -290,8 +296,12 @@ impl<K, V, S> HashMap<K, V, S> {
             return table;
         }
 
-        let new_table =
-            Owned::new(Table::new(Self::DEFAULT_BUCKETS, Self::default_locks())).into_shared(guard);
+        let new_table = Owned::new(Table::new(
+            capacity.unwrap_or(Self::DEFAULT_BUCKETS),
+            // TODO: calculate locks from cap
+            Self::default_locks(),
+        ))
+        .into_shared(guard);
         self.table.store(new_table, Ordering::Release);
         return new_table;
     }
@@ -310,12 +320,8 @@ where
     {
         let hash = self.hash(key);
 
-        let table_ptr = self.table.load(Ordering::Acquire, guard);
-        if table_ptr.is_null() {
-            return None;
-        }
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
-        let table = unsafe { table_ptr.deref() };
         let bucket_index = bucket_index(hash, table.buckets.len() as _);
         let mut node_ptr = table.buckets.get(bucket_index as usize);
 
@@ -383,7 +389,7 @@ where
             let mut table_ptr = self.table.load(Ordering::Acquire, guard);
 
             if table_ptr.is_null() {
-                table_ptr = self.init_table(guard);
+                table_ptr = self.init_table(None, guard);
             }
 
             let table = unsafe { table_ptr.deref() };
@@ -463,7 +469,7 @@ where
                 //
                 // It is also possible that GrowTable will increase the budget but won't resize the
                 // hash table, if it is being poorly utilized due to a bad hash function.
-                if count > self.budget.load(Ordering::SeqCst) as _ {
+                if count > self.budget.load(Ordering::SeqCst) {
                     should_resize = true;
                 }
             }
@@ -475,8 +481,7 @@ where
             // then verify that the table we passed to it as the argument is still the
             // current table.
             if should_resize {
-                // SAFETY: We know `table_ptr` is valid because we initialized it above.
-                unsafe { self.resize(table_ptr, guard, None) };
+                self.resize(table, None, guard);
             }
 
             return None;
@@ -493,10 +498,10 @@ where
         let hash = self.hash(key);
 
         loop {
-            let mut table_ptr = self.table.load(Ordering::Acquire, guard);
+            let table_ptr = self.table.load(Ordering::Acquire, guard);
 
             if table_ptr.is_null() {
-                table_ptr = self.init_table(guard);
+                return None;
             }
 
             let table = unsafe { table_ptr.deref() };
@@ -574,7 +579,7 @@ where
                 let new_budget = new_table.buckets.len() / new_table.locks.len();
 
                 self.table.store(Owned::new(new_table), Ordering::Release);
-                self.budget.store(1.max(new_budget as _), Ordering::SeqCst);
+                self.budget.store(1.max(new_budget), Ordering::SeqCst);
 
                 // TODO: destroy everything
                 unsafe {
@@ -585,32 +590,36 @@ where
         }
     }
 
+    /// Reserves capacity for at least additional more elements to be inserted in the `HashMap`.
+    pub(crate) fn reserve<'g>(&'g self, additional: usize, guard: &'g Guard) {
+        match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+            Some(table) => {
+                let capacity = table.len(guard) + additional;
+                unsafe { self.resize(table, Some(capacity), guard) };
+            }
+            None => {
+                self.init_table(Some(additional), guard);
+            }
+        }
+    }
+
     /// Replaces the hash-table with a larger one.
     ///
-    /// To prevent multiple threads from resizing the buckets as a result of races,
-    /// the `table` instance that holds the buckets of buckets deemed too small must
-    /// be passed as an argument. `resize` obtains a lock, and then checks if the
-    /// buckets has been replaced in the meantime or not.
+    /// To prevent multiple threads from resizing the table as a result of races,
+    /// the `table` instance that holds the buckets of table deemed too small must
+    /// be passed as an argument. We then acquire the resize lock and check if the
+    /// table has been replaced in the meantime or not.
     ///
     /// This function may not resize the table if it values are found to be poorly
     /// distributed across buckets. Instead the budget will be increased.
     ///
     /// If a `new_len` is given, that length will be used instead of the default
     /// resizing behavior.
-    ///
-    /// # Safety
-    ///
-    /// `table_ptr` must not be null.
-    unsafe fn resize<'g>(
-        &'g self,
-        table_ptr: Shared<'g, Table<K, V>>,
-        guard: &'g Guard,
-        new_len: Option<usize>,
-    ) {
+    fn resize<'g>(&'g self, table: &'g Table<K, V>, new_len: Option<usize>, guard: &'g Guard) {
         let _guard = self.resize.lock();
 
         // Make sure nobody resized the table while we were waiting for the resize lock.
-        if table_ptr != self.table.load(Ordering::Acquire, guard) {
+        if Shared::from(table as *const _) != self.table.load(Ordering::Acquire, guard) {
             // We assume that since the table reference is different, it was
             // already resized (or the budget was adjusted). If we ever decide
             // to do table shrinking, or replace the table for other reasons,
@@ -618,15 +627,11 @@ where
             return;
         }
 
-        let table = unsafe { table_ptr.deref() };
-
         let mut overflowed = false;
         let mut new_len = match new_len {
             Some(len) => len,
             None => {
-                let approx_len = unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
-                    .iter()
-                    .fold(0, |acc, c| acc + c.load(Ordering::Relaxed));
+                let approx_len = table.len(guard);
 
                 // If the bucket array is too empty, double the budget instead of resizing the table
                 if approx_len < table.buckets.len() / 4 {
@@ -751,7 +756,7 @@ where
         );
 
         unsafe {
-            guard.defer_destroy(table_ptr);
+            guard.defer_destroy(Shared::from(table as *const _));
         }
     }
 }

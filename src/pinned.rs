@@ -249,6 +249,25 @@ where
     pub fn clear(&self) {
         self.map.clear(&self.guard)
     }
+
+    /// Reserves capacity for at least `additional` more elements to be inserted
+    /// in the `HashMap`. The collection may reserve more space to avoid
+    /// frequent reallocations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new allocation size overflows [`usize`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// let mut map: HashMap<&str, i32> = HashMap::new();
+    /// map.reserve(10);
+    /// ```
+    pub fn reserve(&self, additional: usize) {
+        self.map.reserve(additional, &self.guard);
+    }
 }
 
 impl<K, Q, V, S> Index<&'_ Q> for Pinned<'_, K, V, S>
