@@ -1,4 +1,3 @@
-use crate::atomic_array::{AtomicArray, AtomicArrayBuilder};
 use crate::Pinned;
 
 use std::borrow::Borrow;
@@ -41,29 +40,35 @@ struct Table<K, V> {
     // The hashtable.
     buckets: Box<[Atomic<Node<K, V>>]>,
     // A set of locks, each guarding a number of buckets.
+    //
+    // Locks are shared across table instances during
+    // resizing, hence the `Arc`s.
     locks: Arc<[Arc<Mutex<()>>]>,
     // The number of elements guarded by each lock.
-    count_per_lock: AtomicArray<AtomicUsize>,
+    counts: Box<[AtomicUsize]>,
 }
 
 impl<K, V> Table<K, V> {
     fn new(buckets_len: usize, locks_len: usize) -> Self {
         Self {
-            buckets: std::iter::repeat_with(|| Atomic::null())
+            buckets: std::iter::repeat_with(Default::default)
                 .take(buckets_len)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            locks: std::iter::repeat_with(|| Arc::new(Mutex::new(())))
+            locks: std::iter::repeat_with(Default::default)
                 .take(locks_len)
                 .collect::<Vec<_>>()
                 .into(),
-            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), locks_len).build(),
+            counts: std::iter::repeat_with(Default::default)
+                .take(locks_len)
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
-    fn len(&self, guard: &Guard) -> usize {
+    fn len(&self) -> usize {
         // TODO: is this too slow? should we store a cached total length?
-        unsafe { self.count_per_lock.load(Ordering::Acquire, guard) }
+        self.counts
             .iter()
             .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
     }
@@ -234,7 +239,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
 
         match table {
-            Some(table) => table.len(guard),
+            Some(table) => table.len(),
             None => 0,
         }
     }
@@ -440,11 +445,8 @@ where
 
                 node.store(Owned::new(new), Ordering::Release);
 
-                let count = unsafe {
-                    table.count_per_lock.load(Ordering::Acquire, guard)[lock_index as usize]
-                        .fetch_add(1, Ordering::AcqRel)
-                        + 1
-                };
+                let count =
+                    unsafe { table.counts[lock_index as usize].fetch_add(1, Ordering::AcqRel) + 1 };
 
                 // If the number of elements guarded by this lock has exceeded the budget, resize
                 // the hash table.
@@ -511,10 +513,7 @@ where
                         let next = node.next.load(Ordering::Acquire, guard);
                         node_ptr.store(next, Ordering::Release);
 
-                        unsafe {
-                            table.count_per_lock.load(Ordering::Acquire, guard)[lock_index as usize]
-                                .fetch_min(1, Ordering::AcqRel)
-                        };
+                        unsafe { table.counts[lock_index as usize].fetch_min(1, Ordering::AcqRel) };
 
                         let val = unsafe { node.value.as_ref() };
 
@@ -554,11 +553,10 @@ where
             let new_table = Table {
                 buckets: vec![].into_boxed_slice(),
                 locks: table.locks.clone(),
-                count_per_lock: AtomicArrayBuilder::from_fn(
-                    || AtomicUsize::new(0),
-                    table.locks.len(),
-                )
-                .build(),
+                counts: std::iter::from_fn(Default::default)
+                    .take(table.locks.len())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
             };
 
             let new_budget = new_table.buckets.len() / new_table.locks.len();
@@ -568,7 +566,7 @@ where
 
             // walk through the table buckets, and set each initial node to null, destroying the rest
             // of the nodes and values.
-            for i in 0..table.len(guard) {
+            for i in 0..table.len() {
                 let node_ptr = table.buckets.get(i).unwrap();
                 let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
 
@@ -599,7 +597,7 @@ where
     pub(crate) fn reserve<'g>(&'g self, additional: usize, guard: &'g Guard) {
         match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
             Some(table) => {
-                let capacity = table.len(guard) + additional;
+                let capacity = table.len() + additional;
                 unsafe { self.resize(table, Some(capacity), guard) };
             }
             None => {
@@ -636,7 +634,7 @@ where
         let mut new_len = match new_len {
             Some(len) => len,
             None => {
-                let approx_len = table.len(guard);
+                let approx_len = table.len();
 
                 // If the bucket array is too empty, double the budget instead of resizing the table
                 if approx_len < table.buckets.len() / 4 {
@@ -711,11 +709,13 @@ where
             new_locks = Some(locks);
         }
 
-        let new_count_per_lock = AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), new_locks_len);
+        let new_count_per_lock = std::iter::repeat_with(Default::default)
+            .take(new_locks_len)
+            .collect::<Vec<AtomicUsize>>();
 
-        let mut new_buckets = std::iter::repeat_with(|| Atomic::null())
+        let mut new_buckets = std::iter::repeat_with(Default::default)
             .take(new_len)
-            .collect::<Vec<_>>();
+            .collect::<Vec<Atomic<_>>>();
 
         // Now lock the rest of the buckets to make sure nothing is modified while resizing.
         let _guard_rest = table.lock_range(1..table.locks.len());
@@ -737,8 +737,7 @@ where
                     hash: node.hash,
                 });
 
-                new_count_per_lock.as_ref()[new_lock_index as usize]
-                    .fetch_add(1, Ordering::Relaxed);
+                new_count_per_lock[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
 
                 current = next;
             }
@@ -755,7 +754,7 @@ where
                 locks: new_locks
                     .map(Arc::from)
                     .unwrap_or_else(|| table.locks.clone()),
-                count_per_lock: new_count_per_lock.build(),
+                counts: new_count_per_lock.into_boxed_slice(),
             }),
             Ordering::Release,
         );
