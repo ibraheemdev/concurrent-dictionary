@@ -6,7 +6,7 @@ edition = "2018"
 license = "MIT"
 
 readme = "README.md"
-description = "A Rust concurrent HashMap optimized for read-heavy workloads"
+description = "A concurrent HashMap optimized for read-heavy workloads"
 repository = "https://github.com/ibraheemdev/seize"
 
 keywords = ["hashmap", "concurrent", "map"]
