@@ -24,7 +24,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -86,7 +86,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let a = HashMap::new();
     /// let pinned = a.pin();
@@ -104,7 +104,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let a = HashMap::new();
     /// let pinned = a.pin();
@@ -132,7 +132,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let map = HashMap::new();
     /// let pinned = map.pin();
@@ -157,7 +157,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -190,7 +190,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let map = HashMap::new();
     /// let pinned = map.pin();
@@ -216,7 +216,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     ///
     /// let map = HashMap::new();
     /// let pinned = map.pin();

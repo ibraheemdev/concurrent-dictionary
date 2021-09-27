@@ -66,7 +66,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     /// let map: HashMap<&str, i32> = HashMap::new();
     /// ```
     pub fn new() -> Self {
@@ -91,7 +91,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     /// use std::collections::hash_map::RandomState;
     ///
     /// let s = RandomState::new();
@@ -121,7 +121,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_dictionary::HashMap;
+    /// use seize::HashMap;
     /// use std::collections::hash_map::RandomState;
     ///
     /// let s = RandomState::new();
@@ -742,7 +742,7 @@ where
 /// # Example
 ///
 /// ```
-/// use concurrent_dictionary::HashMap;
+/// use seize::HashMap;
 ///
 /// let mut map = HashMap::new();
 /// map.insert("a", 1);
@@ -817,7 +817,7 @@ impl<K, V> Clone for Iter<'_, K, V> {
 /// # Example
 ///
 /// ```
-/// use concurrent_dictionary::HashMap;
+/// use seize::HashMap;
 ///
 /// let mut map = HashMap::new();
 /// map.insert("a", 1);
@@ -863,7 +863,7 @@ impl<K, V> Clone for Keys<'_, K, V> {
 /// # Example
 ///
 /// ```
-/// use concurrent_dictionary::HashMap;
+/// use seize::HashMap;
 ///
 /// let mut map = HashMap::new();
 /// map.insert("a", 1);
