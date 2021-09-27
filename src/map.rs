@@ -18,7 +18,7 @@ pub struct HashMap<K, V, S = RandomState> {
     // The maximum number of elements per lock before we re-allocate.
     budget: AtomicUsize,
     // The builder used to hash map keys.
-    hash_builder: S,
+    build_hasher: S,
     // The internal state of this map.
     //
     // Wrapping this in a separate struct allows us
@@ -148,7 +148,7 @@ where
             budget: AtomicUsize::new(capacity / num_cpus),
             table: Atomic::new(table),
             collector: Collector::new(),
-            hash_builder,
+            build_hasher: hash_builder,
         }
     }
 }
@@ -432,6 +432,7 @@ where
     pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
         Iter {
+            size: self.len(guard),
             current_node: table.buckets.get(0),
             table,
             current_bucket: 0,
@@ -653,7 +654,7 @@ where
     where
         Q: Hash + ?Sized,
     {
-        let mut h = self.hash_builder.build_hasher();
+        let mut h = self.build_hasher.build_hasher();
         key.hash(&mut h);
         h.finish()
     }
@@ -664,6 +665,7 @@ pub struct Iter<'g, K, V> {
     guard: &'g Guard,
     current_node: Option<&'g Atomic<Node<K, V>>>,
     current_bucket: usize,
+    size: usize,
 }
 
 impl<'g, K, V> Iterator for Iter<'g, K, V> {
@@ -675,6 +677,7 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
                 .current_node
                 .and_then(|n| unsafe { n.load(Ordering::Acquire, self.guard).as_ref() })
             {
+                self.size -= 1;
                 self.current_node = Some(&node.next);
                 return Some((&node.key, unsafe { node.value.as_ref() }));
             }
@@ -687,6 +690,10 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
 
             self.current_node = Some(&self.table.buckets[self.current_bucket]);
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.size, Some(self.size))
     }
 }
 
@@ -706,25 +713,25 @@ fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
     lock_index
 }
 
-// impl<K, V, S> Clone for HashMap<K, V, S>
-// where
-//     K: Sync + Send + Clone + Hash + Eq,
-//     V: Sync + Send + Clone,
-//     S: BuildHasher + Clone,
-// {
-//     fn clone(&self) -> HashMap<K, V, S> {
-//         let cloned_map = Self::with_capacity_and_hasher(self.len(), self.build_hasher.clone());
-//
-//         {
-//             let guard = crossbeam_epoch::pin();
-//             for (k, v) in self.iter(&guard) {
-//                 cloned_map.insert(k.clone(), v.clone(), &guard);
-//             }
-//         }
-//
-//         cloned_map
-//     }
-// }
+impl<K, V, S> Clone for HashMap<K, V, S>
+where
+    K: Sync + Send + Clone + Hash + Eq,
+    V: Sync + Send + Clone,
+    S: BuildHasher + Clone,
+{
+    fn clone(&self) -> HashMap<K, V, S> {
+        let self_pinned = self.pin();
+
+        let cloned = Self::with_capacity_and_hasher(self_pinned.len(), self.build_hasher.clone());
+        let cloned_pin = cloned.pin();
+
+        for (k, v) in self_pinned.iter() {
+            cloned_pin.insert(k.clone(), v.clone());
+        }
+
+        cloned
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -751,6 +758,13 @@ mod tests {
             assert_eq!(pinned.get(&i), Some(&"a"));
         }
 
-        assert!(pinned.iter().count() == pinned.len() && pinned.len() == 100);
+        assert!([
+            pinned.iter().count(),
+            pinned.len(),
+            pinned.iter().size_hint().0,
+            pinned.iter().size_hint().1.unwrap()
+        ]
+        .iter()
+        .all(|&l| l == 100));
     }
 }
