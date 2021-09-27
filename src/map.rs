@@ -19,7 +19,7 @@ pub struct HashMap<K, V, S = RandomState> {
     // The maximum number of elements per lock before we re-allocate.
     budget: AtomicUsize,
     // The builder used to hash map keys.
-    build_hasher: S,
+    hash_builder: S,
     // The internal state of this map.
     //
     // Wrapping this in a separate struct allows us
@@ -33,6 +33,8 @@ pub struct HashMap<K, V, S = RandomState> {
     // bounds. But a local collector will destroy all remaining garbage when
     // the map is dropped, so we can accept non-'static keys and values.
     collector: Collector,
+    // The lock acquired when resizing.
+    resize: Arc<Mutex<()>>,
 }
 
 struct Table<K, V> {
@@ -42,6 +44,61 @@ struct Table<K, V> {
     locks: Arc<[Arc<Mutex<()>>]>,
     // The number of elements guarded by each lock.
     count_per_lock: AtomicArray<AtomicUsize>,
+}
+
+impl<K, V> Table<K, V> {
+    fn new(buckets_len: usize, locks_len: usize) -> Self {
+        Self {
+            buckets: std::iter::repeat_with(|| Atomic::null())
+                .take(buckets_len)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            locks: std::iter::repeat_with(|| Arc::new(Mutex::new(())))
+                .take(locks_len)
+                .collect::<Vec<_>>()
+                .into(),
+            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), locks_len).build(),
+        }
+    }
+
+    /// Acquires all locks for this hash bucket.
+    fn lock_all<'g>(&'g self) -> (impl Drop + 'g, impl Drop + 'g) {
+        // Acquire the first lock.
+        let _guard = self.lock_range(0..1);
+
+        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
+        // and so we can safely read locks.len().
+        let _guard_rest = self.lock_range(1..self.locks.len());
+
+        (_guard, _guard_rest)
+    }
+
+    /// Acquires a contiguous range of locks for this hash bucket.
+    fn lock_range<'g>(&'g self, range: Range<usize>) -> impl Drop + 'g {
+        for i in range.clone() {
+            unsafe {
+                self.locks[i].raw().lock();
+            }
+        }
+
+        /// Unlocks the specified locks on drop.
+        struct Unlock<'g, K, V> {
+            table: &'g Table<K, V>,
+            range: Range<usize>,
+        }
+
+        impl<K, V> Drop for Unlock<'_, K, V> {
+            fn drop(&mut self) {
+                for i in self.range.clone() {
+                    unsafe {
+                        self.table.locks[i].raw().unlock();
+                    }
+                }
+            }
+        }
+
+        Unlock { table: self, range }
+    }
 }
 
 //A singly-linked list representing a bucket in the hashtable
@@ -70,11 +127,25 @@ impl<K, V> HashMap<K, V, RandomState> {
     /// let map: HashMap<&str, i32> = HashMap::new();
     /// ```
     pub fn new() -> Self {
-        Self::with_capacity_and_hasher(1, RandomState::new())
+        Self::with_hasher(RandomState::new())
     }
 }
 
 impl<K, V, S> HashMap<K, V, S> {
+    /// The maximum # of buckets the buckets can hold.
+    const MAX_BUCKETS: usize = isize::MAX as _;
+
+    /// The hash-table will be resized to this amount on the first insert
+    /// unless an alternative capacity is specified.
+    const DEFAULT_BUCKETS: usize = 31;
+
+    /// The maximum size of the `locks` array.
+    const MAX_LOCKS: usize = 1024;
+
+    fn default_locks() -> usize {
+        num_cpus::get()
+    }
+
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
     ///
@@ -101,7 +172,13 @@ impl<K, V, S> HashMap<K, V, S> {
     /// pinned.insert(1, 2);
     /// ```
     pub fn with_hasher(hash_builder: S) -> Self {
-        Self::with_capacity_and_hasher(0, hash_builder)
+        Self {
+            hash_builder,
+            resize: Arc::new(Mutex::new(())),
+            budget: AtomicUsize::new(0),
+            table: Atomic::null(),
+            collector: Collector::new(),
+        }
     }
 
     /// Creates an empty `HashMap` with the specified capacity, using `hash_builder`
@@ -129,24 +206,18 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        let num_cpus = num_cpus::get();
-        let table = Table {
-            buckets: std::iter::repeat_with(|| Atomic::null())
-                .take(capacity)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            locks: std::iter::repeat_with(|| Arc::new(Mutex::new(())))
-                .take(num_cpus)
-                .collect::<Vec<_>>()
-                .into(),
-            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), num_cpus).build(),
-        };
+        if capacity == 0 {
+            return Self::with_hasher(hash_builder);
+        }
+
+        let lock_count = capacity.checked_div(4).unwrap_or_else(num_cpus::get);
 
         Self {
-            budget: AtomicUsize::new(capacity / num_cpus),
-            table: Atomic::new(table),
+            resize: Arc::new(Mutex::new(())),
+            budget: AtomicUsize::new(capacity / lock_count),
+            table: Atomic::new(Table::new(capacity, lock_count)),
             collector: Collector::new(),
-            build_hasher: hash_builder,
+            hash_builder,
         }
     }
 }
@@ -165,12 +236,17 @@ impl<K, V, S> HashMap<K, V, S> {
 
     /// Returns the number of elements in the map.
     pub(crate) fn len(&self, guard: &Guard) -> usize {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
 
-        // TODO: is this too slow? should we store a cached total length?
-        unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
-            .iter()
-            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
+        match table {
+            Some(table) => {
+                // TODO: is this too slow? should we store a cached total length?
+                unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
+                    .iter()
+                    .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
+            }
+            None => 0,
+        }
     }
 
     /// Returns `true` if the map contains no elements.
@@ -180,10 +256,12 @@ impl<K, V, S> HashMap<K, V, S> {
 
     /// An iterator visiting all key-value pairs in arbitrary order.
     pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        let table = self.table.load(Ordering::Acquire, guard);
+        let first_node = unsafe { table.as_ref().and_then(|t| t.buckets.get(0)) };
+
         Iter {
             size: self.len(guard),
-            current_node: table.buckets.get(0),
+            current_node: first_node,
             table,
             current_bucket: 0,
             guard,
@@ -203,6 +281,20 @@ impl<K, V, S> HashMap<K, V, S> {
             iter: self.iter(guard),
         }
     }
+
+    fn init_table<'g>(&'g self, guard: &'g Guard) -> Shared<'g, Table<K, V>> {
+        let _guard = self.resize.lock();
+        let table = self.table.load(Ordering::Acquire, guard);
+
+        if !table.is_null() {
+            return table;
+        }
+
+        let new_table =
+            Owned::new(Table::new(Self::DEFAULT_BUCKETS, Self::default_locks())).into_shared(guard);
+        self.table.store(new_table, Ordering::Release);
+        return new_table;
+    }
 }
 
 impl<K, V, S> HashMap<K, V, S>
@@ -217,9 +309,14 @@ where
         Q: Hash + Eq,
     {
         let hash = self.hash(key);
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let bucket_index = bucket_index(hash, table.buckets.len() as _);
 
+        let table_ptr = self.table.load(Ordering::Acquire, guard);
+        if table_ptr.is_null() {
+            return None;
+        }
+
+        let table = unsafe { table_ptr.deref() };
+        let bucket_index = bucket_index(hash, table.buckets.len() as _);
         let mut node_ptr = table.buckets.get(bucket_index as usize);
 
         while let Some(node) = node_ptr {
@@ -252,64 +349,11 @@ where
         self.get(key, &guard).is_some()
     }
 
-    /// Acquires all locks for this hash buckets.
-    fn lock_all<'g>(&'g self, guard: &'g Guard) -> (impl Drop + 'g, impl Drop + 'g) {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let locks = &table.locks;
-
-        // Acquire the first lock.
-        let _guard = self.lock_range(0..1, guard);
-
-        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
-        // and so we can safely read locks.len().
-        let _guard_rest = self.lock_range(1..locks.len(), guard);
-
-        (_guard, _guard_rest)
-    }
-
-    /// Acquires a contiguous range of locks for this hash buckets.
-    fn lock_range<'g>(&'g self, range: Range<usize>, guard: &'g Guard) -> impl Drop + 'g {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let locks = &table.locks;
-
-        for i in range.clone() {
-            unsafe {
-                locks[i].raw().lock();
-            }
-        }
-
-        /// Unlocks the specified locks on drop.
-        struct Unlock<'g, K, V, S> {
-            map: &'g HashMap<K, V, S>,
-            guard: &'g Guard,
-            range: Range<usize>,
-        }
-
-        impl<K, V, S> Drop for Unlock<'_, K, V, S> {
-            fn drop(&mut self) {
-                let table = unsafe { self.map.table.load(Ordering::Acquire, self.guard).deref() };
-                let locks = &table.locks;
-
-                for i in self.range.clone() {
-                    unsafe {
-                        locks[i].raw().unlock();
-                    }
-                }
-            }
-        }
-
-        Unlock {
-            map: self,
-            guard,
-            range,
-        }
-    }
-
     fn hash<Q>(&self, key: &Q) -> u64
     where
         Q: Hash + ?Sized,
     {
-        let mut h = self.build_hasher.build_hasher();
+        let mut h = self.hash_builder.build_hasher();
         key.hash(&mut h);
         h.finish()
     }
@@ -324,12 +368,6 @@ where
     K: Hash + Eq + Send + Sync + Clone,
     S: BuildHasher,
 {
-    /// The maximum # of buckets the buckets can hold.
-    const MAX_BUCKETS: usize = isize::MAX as _;
-
-    /// The maximum size of the `locks` array.
-    const MAX_LOCKS: usize = 1024;
-
     /// Inserts a key-value pair into the map.
     ///
     /// If the map did not have this key present, [`None`] is returned.
@@ -342,7 +380,12 @@ where
         let mut should_resize = false;
 
         loop {
-            let table_ptr = self.table.load(Ordering::Acquire, guard);
+            let mut table_ptr = self.table.load(Ordering::Acquire, guard);
+
+            if table_ptr.is_null() {
+                table_ptr = self.init_table(guard);
+            }
+
             let table = unsafe { table_ptr.deref() };
 
             let bucket_index = bucket_index(hash, table.buckets.len() as _);
@@ -352,10 +395,7 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !std::ptr::eq(
-                    table_ptr.as_raw(),
-                    self.table.load(Ordering::Acquire, guard).as_raw(),
-                ) {
+                if table_ptr != self.table.load(Ordering::Acquire, guard) {
                     continue;
                 }
 
@@ -423,7 +463,7 @@ where
                 //
                 // It is also possible that GrowTable will increase the budget but won't resize the
                 // hash table, if it is being poorly utilized due to a bad hash function.
-                if count > self.budget.load(Ordering::SeqCst) {
+                if count > self.budget.load(Ordering::SeqCst) as _ {
                     should_resize = true;
                 }
             }
@@ -431,11 +471,12 @@ where
             // We just performed an insertion. If necessary, we will resize the buckets.
             // Notice that we are not holding any locks when calling resize.
             // This is necessary to prevent deadlocks. As a result, it is possible that
-            // resize will be called unnecessarily. But, it will obtain lock 0 and
+            // resize will be called unnecessarily, but, it will obtain the resize lock and
             // then verify that the table we passed to it as the argument is still the
             // current table.
             if should_resize {
-                self.resize(table_ptr, guard);
+                // SAFETY: We know `table_ptr` is valid because we initialized it above.
+                unsafe { self.resize(table_ptr, guard, None) };
             }
 
             return None;
@@ -452,7 +493,12 @@ where
         let hash = self.hash(key);
 
         loop {
-            let table_ptr = self.table.load(Ordering::Acquire, guard);
+            let mut table_ptr = self.table.load(Ordering::Acquire, guard);
+
+            if table_ptr.is_null() {
+                table_ptr = self.init_table(guard);
+            }
+
             let table = unsafe { table_ptr.deref() };
 
             let bucket_index = bucket_index(hash, table.buckets.len() as _);
@@ -462,10 +508,7 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !std::ptr::eq(
-                    table_ptr.as_raw(),
-                    self.table.load(Ordering::Acquire, guard).as_raw(),
-                ) {
+                if table_ptr != self.table.load(Ordering::Acquire, guard) {
                     continue;
                 }
 
@@ -512,33 +555,37 @@ where
 
     /// Clears the map, removing all key-value pairs.
     pub(crate) fn clear(&self, guard: &Guard) {
-        let _guard = self.lock_all(guard);
-
         let table_ptr = self.table.load(Ordering::Acquire, guard);
-        let table = unsafe { table_ptr.deref() };
 
-        let new_table = Table {
-            buckets: std::iter::repeat_with(|| Atomic::null())
-                .take(0)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            locks: table.locks.clone(),
-            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), table.locks.len())
-                .build(),
-        };
+        match unsafe { table_ptr.as_ref() } {
+            Some(table) => {
+                let _guard = table.lock_all();
 
-        let new_budget = new_table.buckets.len() / new_table.locks.len();
+                let new_table = Table {
+                    buckets: vec![].into_boxed_slice(),
+                    locks: table.locks.clone(),
+                    count_per_lock: AtomicArrayBuilder::from_fn(
+                        || AtomicUsize::new(0),
+                        table.locks.len(),
+                    )
+                    .build(),
+                };
 
-        self.table.store(Owned::new(new_table), Ordering::Release);
-        self.budget.store(1.max(new_budget), Ordering::SeqCst);
+                let new_budget = new_table.buckets.len() / new_table.locks.len();
 
-        // TODO: destroy everything
-        unsafe {
-            guard.defer_destroy(table_ptr);
-        };
+                self.table.store(Owned::new(new_table), Ordering::Release);
+                self.budget.store(1.max(new_budget as _), Ordering::SeqCst);
+
+                // TODO: destroy everything
+                unsafe {
+                    guard.defer_destroy(table_ptr);
+                };
+            }
+            None => return,
+        }
     }
 
-    /// Replaces the bucket buckets with a larger one.
+    /// Replaces the hash-table with a larger one.
     ///
     /// To prevent multiple threads from resizing the buckets as a result of races,
     /// the `table` instance that holds the buckets of buckets deemed too small must
@@ -547,87 +594,93 @@ where
     ///
     /// This function may not resize the table if it values are found to be poorly
     /// distributed across buckets. Instead the budget will be increased.
-    fn resize<'g>(&'g self, table_ptr: Shared<'g, Table<K, V>>, guard: &'g Guard) {
-        let table = unsafe { table_ptr.deref() };
+    ///
+    /// If a `new_len` is given, that length will be used instead of the default
+    /// resizing behavior.
+    ///
+    /// # Safety
+    ///
+    /// `table_ptr` must not be null.
+    unsafe fn resize<'g>(
+        &'g self,
+        table_ptr: Shared<'g, Table<K, V>>,
+        guard: &'g Guard,
+        new_len: Option<usize>,
+    ) {
+        let _guard = self.resize.lock();
 
-        // The thread that first obtains lock 0 will be the one doing the resize operation
-        let _guard = self.lock_range(0..1, guard);
-
-        // Make sure nobody resized the table while we were waiting for lock 0:
-        if !std::ptr::eq(
-            table_ptr.as_raw(),
-            self.table.load(Ordering::Acquire, guard).as_raw(),
-        ) {
-            // We assume that since the table reference is different,
-            // it was already resized (or the budget was adjusted).
-            // If we ever decide to do table shrinking, or replace the table for other reasons,
+        // Make sure nobody resized the table while we were waiting for the resize lock.
+        if table_ptr != self.table.load(Ordering::Acquire, guard) {
+            // We assume that since the table reference is different, it was
+            // already resized (or the budget was adjusted). If we ever decide
+            // to do table shrinking, or replace the table for other reasons,
             // we will have to revisit this logic.
             return;
         }
 
-        let approx_len = unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
-            .iter()
-            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed));
+        let table = unsafe { table_ptr.deref() };
 
-        // If the bucket array is too empty, double the budget instead of resizing the table
-        if approx_len < table.buckets.len() / 4 {
-            let budget = self.budget.load(Ordering::SeqCst);
-            self.budget.store(budget * 2, Ordering::SeqCst);
-        }
+        let mut overflowed = false;
+        let mut new_len = match new_len {
+            Some(len) => len,
+            None => {
+                let approx_len = unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
+                    .iter()
+                    .fold(0, |acc, c| acc + c.load(Ordering::Relaxed));
 
-        let mut new_len = 0;
-        let mut max_size = false;
+                // If the bucket array is too empty, double the budget instead of resizing the table
+                if approx_len < table.buckets.len() / 4 {
+                    let budget = self.budget.load(Ordering::SeqCst);
+                    self.budget.store(budget * 2, Ordering::SeqCst);
+                }
 
-        // Compute the new buckets size.
-        //
-        // The current method is to find the smallest integer that is:
-        //
-        // 1) larger than twice the previous buckets size
-        // 2) not divisible by 2, 3, 5 or 7.
-        //
-        // This may change in the future.
-        let mut compute_new_size = || {
-            // Double the size of the buckets buckets and add one, so that we have an odd integer.
-            new_len = table.buckets.len().checked_mul(2)?.checked_add(1)?;
+                let mut new_len = 0;
 
-            // Now, we only need to check odd integers, and find the first that is not divisible
-            // by 3, 5 or 7.
-            while new_len.checked_rem(3)? == 0
-                || new_len.checked_rem(5)? == 0
-                || new_len.checked_rem(7)? == 0
-            {
-                new_len = new_len.checked_add(2)?;
+                // Compute the new buckets size.
+                //
+                // The current method is to find the smallest integer that is:
+                //
+                // 1) larger than twice the previous buckets size
+                // 2) not divisible by 2, 3, 5 or 7.
+                //
+                // This may change in the future.
+                let mut compute_new_len = || {
+                    // Double the size of the buckets buckets and add one, so that we have an odd integer.
+                    new_len = table.buckets.len().checked_mul(2)?.checked_add(1)?;
+
+                    // Now, we only need to check odd integers, and find the first that is not divisible
+                    // by 3, 5 or 7.
+                    while new_len.checked_rem(3)? == 0
+                        || new_len.checked_rem(5)? == 0
+                        || new_len.checked_rem(7)? == 0
+                    {
+                        new_len = new_len.checked_add(2)?;
+                    }
+
+                    debug_assert!(new_len % 2 != 0);
+
+                    Some(())
+                };
+
+                match compute_new_len() {
+                    Some(()) => {}
+                    None => {
+                        overflowed = true;
+                    }
+                }
+
+                new_len
             }
-
-            debug_assert!(new_len % 2 != 0);
-
-            if new_len > Self::MAX_BUCKETS {
-                max_size = true;
-            }
-
-            Some(())
         };
 
-        match compute_new_size() {
-            Some(()) => {}
-            None => {
-                max_size = true;
-            }
-        }
-
-        if max_size {
+        if overflowed || new_len > Self::MAX_BUCKETS {
             new_len = Self::MAX_BUCKETS;
 
-            // Set the budget to `usize::MAX` to make sure `resize_buckets`
+            // Set the budget to `usize::MAX` to make sure `resize`
             // is never called again (unless the buckets is shrunk), because
             // the buckets is at it's maximum size.
             self.budget.store(usize::MAX, Ordering::SeqCst);
         }
-
-        // Now lock the rest of the buckets.
-        //
-        // TODO: could this go after creating the new locks?
-        let _guard_rest = self.lock_range(1..table.locks.len(), guard);
 
         let mut new_locks = None;
         let mut new_locks_len = table.locks.len();
@@ -653,6 +706,9 @@ where
         let mut new_buckets = std::iter::repeat_with(|| Atomic::null())
             .take(new_len)
             .collect::<Vec<_>>();
+
+        // Now lock the rest of the buckets to make sure nothing is modified while resizing.
+        let _guard_rest = table.lock_range(1..table.locks.len());
 
         // Copy all data into a new buckets, creating new nodes for all elements.
         for i in 0..table.buckets.len() {
@@ -732,6 +788,84 @@ where
 {
 }
 
+impl<K, V, S> Clone for HashMap<K, V, S>
+where
+    K: Sync + Send + Clone + Hash + Eq,
+    V: Sync + Send + Clone,
+    S: BuildHasher + Clone,
+{
+    fn clone(&self) -> HashMap<K, V, S> {
+        let self_pinned = self.pin();
+
+        let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.hash_builder.clone());
+        let clone_pinned = clone.pin();
+
+        for (k, v) in self_pinned.iter() {
+            clone_pinned.insert(k.clone(), v.clone());
+        }
+
+        clone
+    }
+}
+
+impl<K, V, S> fmt::Debug for HashMap<K, V, S>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guard = self.collector.register().pin();
+        f.debug_map().entries(self.iter(&guard)).finish()
+    }
+}
+
+impl<K, V, S> Default for HashMap<K, V, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    pub(crate) fn eq(&self, guard: &Guard, other: &Self, other_guard: &Guard) -> bool {
+        if self.len(guard) != other.len(other_guard) {
+            return false;
+        }
+
+        self.iter(guard)
+            .all(|(key, value)| other.get(key, other_guard).map_or(false, |v| *value == *v))
+    }
+}
+
+impl<K, V, S> PartialEq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        let guard = self.collector.register().pin();
+        let other_guard = other.collector.register().pin();
+
+        Self::eq(self, &guard, other, &other_guard)
+    }
+}
+
+impl<K, V, S> Eq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+{
+}
+
 /// An iterator over the entries of a `HashMap`.
 ///
 /// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
@@ -749,7 +883,7 @@ where
 /// let iter = map.iter();
 /// ```
 pub struct Iter<'g, K, V> {
-    table: &'g Table<K, V>,
+    table: Shared<'g, Table<K, V>>,
     guard: &'g Guard,
     current_node: Option<&'g Atomic<Node<K, V>>>,
     current_bucket: usize,
@@ -761,6 +895,11 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            let table = match unsafe { self.table.as_ref() } {
+                Some(table) => table,
+                None => return None,
+            };
+
             if let Some(node) = &self
                 .current_node
                 .and_then(|n| unsafe { n.load(Ordering::Acquire, self.guard).as_ref() })
@@ -772,11 +911,11 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
 
             self.current_bucket += 1;
 
-            if self.current_bucket >= self.table.buckets.len() {
+            if self.current_bucket >= table.buckets.len() {
                 return None;
             }
 
-            self.current_node = Some(&self.table.buckets[self.current_bucket]);
+            self.current_node = Some(&table.buckets[self.current_bucket]);
         }
     }
 
@@ -897,84 +1036,6 @@ impl<K, V> Clone for Values<'_, K, V> {
             iter: self.iter.clone(),
         }
     }
-}
-
-impl<K, V, S> Clone for HashMap<K, V, S>
-where
-    K: Sync + Send + Clone + Hash + Eq,
-    V: Sync + Send + Clone,
-    S: BuildHasher + Clone,
-{
-    fn clone(&self) -> HashMap<K, V, S> {
-        let self_pinned = self.pin();
-
-        let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.build_hasher.clone());
-        let clone_pinned = clone.pin();
-
-        for (k, v) in self_pinned.iter() {
-            clone_pinned.insert(k.clone(), v.clone());
-        }
-
-        clone
-    }
-}
-
-impl<K, V, S> fmt::Debug for HashMap<K, V, S>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.collector.register().pin();
-        f.debug_map().entries(self.iter(&guard)).finish()
-    }
-}
-
-impl<K, V, S> Default for HashMap<K, V, S>
-where
-    S: Default,
-{
-    fn default() -> Self {
-        Self::with_hasher(S::default())
-    }
-}
-
-impl<K, V, S> HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    pub(crate) fn eq(&self, guard: &Guard, other: &Self, other_guard: &Guard) -> bool {
-        if self.len(guard) != other.len(other_guard) {
-            return false;
-        }
-
-        self.iter(guard)
-            .all(|(key, value)| other.get(key, other_guard).map_or(false, |v| *value == *v))
-    }
-}
-
-impl<K, V, S> PartialEq for HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    fn eq(&self, other: &Self) -> bool {
-        let guard = self.collector.register().pin();
-        let other_guard = other.collector.register().pin();
-
-        Self::eq(self, &guard, other, &other_guard)
-    }
-}
-
-impl<K, V, S> Eq for HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: Eq,
-    S: BuildHasher,
-{
 }
 
 #[cfg(test)]
