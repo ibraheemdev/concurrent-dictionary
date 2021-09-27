@@ -45,7 +45,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::HashMap;
+    /// use seize::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -66,7 +66,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::HashMap;
+    /// use seize::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -261,7 +261,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use std::collections::HashMap;
+    /// use seize::HashMap;
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     /// map.reserve(10);
     /// ```

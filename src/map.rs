@@ -61,16 +61,11 @@ impl<K, V> Table<K, V> {
         }
     }
 
-    /// Acquires all locks for this hash bucket.
-    fn lock_all(&self) -> (impl Drop + '_, impl Drop + '_) {
-        // Acquire the first lock.
-        let _guard = self.lock_range(0..1);
-
-        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
-        // and so we can safely read locks.len().
-        let _guard_rest = self.lock_range(1..self.locks.len());
-
-        (_guard, _guard_rest)
+    fn len(&self, guard: &Guard) -> usize {
+        // TODO: is this too slow? should we store a cached total length?
+        unsafe { self.count_per_lock.load(Ordering::Acquire, guard) }
+            .iter()
+            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
     }
 
     /// Acquires a contiguous range of locks for this hash bucket.
@@ -98,13 +93,6 @@ impl<K, V> Table<K, V> {
         }
 
         Unlock { table: self, range }
-    }
-
-    fn len(&self, guard: &Guard) -> usize {
-        // TODO: is this too slow? should we store a cached total length?
-        unsafe { self.count_per_lock.load(Ordering::Acquire, guard) }
-            .iter()
-            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
     }
 }
 
@@ -407,14 +395,8 @@ where
 
                 // Try to find this key in the bucket
                 let mut curr = table.buckets.get(bucket_index as usize);
-                loop {
-                    let node_ptr = match curr {
-                        Some(node_ptr) => node_ptr,
-                        None => break,
-                    };
-
-                    let node_ref = node_ptr.load(Ordering::Acquire, guard);
-                    let node = match unsafe { node_ref.as_ref() } {
+                while let Some(node_ptr) = curr {
+                    let node = match unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() } {
                         Some(node) => node,
                         None => break,
                     };
@@ -437,7 +419,7 @@ where
                         let old_val = unsafe { node.value.as_ref() };
 
                         unsafe {
-                            guard.defer_destroy(node_ref);
+                            guard.defer_destroy(Shared::from(node as *const _));
                             guard.defer_destroy(Shared::from(old_val as *const _));
                         };
 
@@ -519,14 +501,8 @@ where
 
                 let mut curr = table.buckets.get(bucket_index as usize);
 
-                loop {
-                    let node_ptr = match curr {
-                        Some(node_ptr) => node_ptr,
-                        None => break,
-                    };
-
-                    let node_ref = node_ptr.load(Ordering::Acquire, guard);
-                    let node = match unsafe { node_ref.as_ref() } {
+                while let Some(node_ptr) = curr {
+                    let node = match unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() } {
                         Some(node) => node,
                         None => break,
                     };
@@ -543,7 +519,7 @@ where
                         let val = unsafe { node.value.as_ref() };
 
                         unsafe {
-                            guard.defer_destroy(node_ref);
+                            guard.defer_destroy(Shared::from(node as *const _));
                             guard.defer_destroy(Shared::from(val as *const _));
                         }
 
@@ -560,33 +536,50 @@ where
 
     /// Clears the map, removing all key-value pairs.
     pub(crate) fn clear(&self, guard: &Guard) {
-        let table_ptr = self.table.load(Ordering::Acquire, guard);
-
-        match unsafe { table_ptr.as_ref() } {
-            Some(table) => {
-                let _guard = table.lock_all();
-
-                let new_table = Table {
-                    buckets: vec![].into_boxed_slice(),
-                    locks: table.locks.clone(),
-                    count_per_lock: AtomicArrayBuilder::from_fn(
-                        || AtomicUsize::new(0),
-                        table.locks.len(),
-                    )
-                    .build(),
-                };
-
-                let new_budget = new_table.buckets.len() / new_table.locks.len();
-
-                self.table.store(Owned::new(new_table), Ordering::Release);
-                self.budget.store(1.max(new_budget), Ordering::SeqCst);
-
-                // TODO: destroy everything
-                unsafe {
-                    guard.defer_destroy(table_ptr);
-                };
-            }
+        let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+            Some(table) => table,
             None => return,
+        };
+
+        let _guard = self.lock_all(table);
+
+        let new_table = Table {
+            buckets: vec![].into_boxed_slice(),
+            locks: table.locks.clone(),
+            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), table.locks.len())
+                .build(),
+        };
+
+        let new_budget = new_table.buckets.len() / new_table.locks.len();
+
+        self.table.store(Owned::new(new_table), Ordering::Release);
+        self.budget.store(1.max(new_budget), Ordering::SeqCst);
+
+        // walk through the table buckets, and set each initial node to null, destroying the rest
+        // of the nodes and values.
+        for i in 0..table.len(guard) {
+            let node_ptr = table.buckets.get(i).unwrap();
+            let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
+
+            if let Some(node) = node {
+                node_ptr.store(Shared::null(), Ordering::Release);
+
+                unsafe {
+                    guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
+                }
+
+                let mut next = &node.next;
+                while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
+                    unsafe {
+                        guard.defer_destroy(Shared::from(node as *const _));
+                        guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
+                    }
+
+                    next = &node.next;
+                }
+            } else {
+                // the node was already null, and we don't have to do anything
+            }
         }
     }
 
@@ -758,6 +751,18 @@ where
         unsafe {
             guard.defer_destroy(Shared::from(table as *const _));
         }
+    }
+
+    /// Acquires all locks for this table.
+    fn lock_all<'g>(&'g self, table: &'g Table<K, V>) -> (impl Drop + 'g, impl Drop + 'g) {
+        // Acquire the resize lock.
+        let _guard = self.resize.lock();
+
+        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
+        // and so we can safely read locks.len().
+        let _guard_rest = table.lock_range(0..table.locks.len());
+
+        (_guard, _guard_rest)
     }
 }
 
