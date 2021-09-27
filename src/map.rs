@@ -542,6 +542,8 @@ where
                 None => return,
             };
 
+            // TODO: acquire each lock and destroy the buckets guarded by it
+            // sequentially instead of all at once
             let _guard = self.lock_all(table);
 
             // Make sure the table didn't change while we were waiting for the lock.
@@ -992,6 +994,10 @@ impl<'g, K, V> Iterator for Keys<'g, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(k, _)| k)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
 }
 
 impl<K, V> fmt::Debug for Keys<'_, K, V>
@@ -1037,6 +1043,10 @@ impl<'g, K, V> Iterator for Values<'g, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(_, v)| v)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
     }
 }
 
