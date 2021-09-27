@@ -429,6 +429,7 @@ where
         self.len(guard) == 0
     }
 
+    /// An iterator visiting all key-value pairs in arbitrary order.
     pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
         Iter {
@@ -437,6 +438,20 @@ where
             table,
             current_bucket: 0,
             guard,
+        }
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    pub(crate) fn keys<'g>(&self, guard: &'g Guard) -> Keys<'g, K, V> {
+        Keys {
+            iter: self.iter(guard),
+        }
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    pub(crate) fn values<'g>(&self, guard: &'g Guard) -> Values<'g, K, V> {
+        Values {
+            iter: self.iter(guard),
         }
     }
 
@@ -457,8 +472,9 @@ where
             table_ptr.as_raw(),
             self.table.load(Ordering::Acquire, guard).as_raw(),
         ) {
-            // We assume that since the table reference is different, it was already resized (or the budget
-            // was adjusted). If we ever decide to do table shrinking, or replace the table for other reasons,
+            // We assume that since the table reference is different,
+            // it was already resized (or the budget was adjusted).
+            // If we ever decide to do table shrinking, or replace the table for other reasons,
             // we will have to revisit this logic.
             return;
         }
@@ -523,6 +539,8 @@ where
         }
 
         // Now lock the rest of the buckets.
+        //
+        // TODO: could this go after creating the new locks?
         let _guard_rest = self.lock_range(1..table.locks.len(), guard);
 
         let mut new_locks = None;
@@ -660,6 +678,22 @@ where
     }
 }
 
+/// An iterator over the entries of a `HashMap`.
+///
+/// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
+/// documentation for more.
+///
+/// [`iter`]: HashMap::iter
+///
+/// # Example
+///
+/// ```
+/// use concurrent_dictionary::HashMap;
+///
+/// let mut map = HashMap::new();
+/// map.insert("a", 1);
+/// let iter = map.iter();
+/// ```
 pub struct Iter<'g, K, V> {
     table: &'g Table<K, V>,
     guard: &'g Guard,
@@ -694,6 +728,62 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.size, Some(self.size))
+    }
+}
+
+/// An iterator over the keys of a `HashMap`.
+///
+/// This `struct` is created by the [`keys`] method on [`HashMap`]. See its
+/// documentation for more.
+///
+/// [`keys`]: HashMap::keys
+///
+/// # Example
+///
+/// ```
+/// use concurrent_dictionary::HashMap;
+///
+/// let mut map = HashMap::new();
+/// map.insert("a", 1);
+/// let iter_keys = map.keys();
+/// ```
+pub struct Keys<'g, K, V> {
+    iter: Iter<'g, K, V>,
+}
+
+impl<'g, K, V> Iterator for Keys<'g, K, V> {
+    type Item = &'g K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(k, _)| k)
+    }
+}
+
+/// An iterator over the values of a `HashMap`.
+///
+/// This `struct` is created by the [`values`] method on [`HashMap`]. See its
+/// documentation for more.
+///
+/// [`values`]: HashMap::values
+///
+/// # Example
+///
+/// ```
+/// use concurrent_dictionary::HashMap;
+///
+/// let mut map = HashMap::new();
+/// map.insert("a", 1);
+/// let iter_values = map.values();
+/// ```
+pub struct Values<'g, K, V> {
+    iter: Iter<'g, K, V>,
+}
+
+impl<'g, K, V> Iterator for Values<'g, K, V> {
+    type Item = &'g V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(_, v)| v)
     }
 }
 

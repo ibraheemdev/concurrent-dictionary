@@ -1,4 +1,4 @@
-use crate::{HashMap, Iter};
+use crate::{HashMap, Iter, Keys, Values};
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -67,6 +67,48 @@ where
     /// ```
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.map.iter(&self.guard)
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    /// The iterator element type is `&'a K`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// for key in map.keys() {
+    ///     println!("{}", key);
+    /// }
+    /// ```
+    pub fn keys(&self) -> Keys<'_, K, V> {
+        self.map.keys(&self.guard)
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    /// The iterator element type is `&'a V`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// for val in map.values() {
+    ///     println!("{}", val);
+    /// }
+    /// ```
+    pub fn values(&self) -> Values<'_, K, V> {
+        self.map.values(&self.guard)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
