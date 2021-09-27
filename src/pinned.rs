@@ -16,38 +16,7 @@ pub struct Pinned<'map, K, V, S = RandomState> {
     pub(crate) guard: Guard,
 }
 
-impl<'map, K, V, S> Pinned<'map, K, V, S>
-where
-    V: Send + Sync,
-    K: Hash + Eq + Send + Sync + Clone,
-    S: BuildHasher,
-{
-    /// Returns a reference to the value corresponding to the key.
-    ///
-    /// The key may be any borrowed form of the map's key type, but
-    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
-    /// the key type.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_dictionary::HashMap;
-    ///
-    /// let map = HashMap::new();
-    /// let pinned = map.pin();
-    ///
-    /// pinned.insert(1, "a");
-    /// assert_eq!(pinned.get(&1), Some(&"a"));
-    /// assert_eq!(pinned.get(&2), None);
-    /// ```
-    pub fn get<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.map.get(key, &self.guard)
-    }
-
+impl<'map, K, V, S> Pinned<'map, K, V, S> {
     /// An iterator visiting all key-value pairs in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`.
     ///
@@ -111,6 +80,73 @@ where
         self.map.values(&self.guard)
     }
 
+    /// Returns the number of elements in the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_dictionary::HashMap;
+    ///
+    /// let a = HashMap::new();
+    /// let pinned = a.pin();
+    ///
+    /// assert_eq!(pinned.len(), 0);
+    /// pinned.insert(1, "a");
+    /// assert_eq!(pinned.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.map.len(&self.guard)
+    }
+
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_dictionary::HashMap;
+    ///
+    /// let a = HashMap::new();
+    /// let pinned = a.pin();
+    ///
+    /// assert!(pinned.is_empty());
+    /// pinned.insert(1, "a");
+    /// assert!(!pinned.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty(&self.guard)
+    }
+}
+
+impl<'map, K, V, S> Pinned<'map, K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_dictionary::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// let pinned = map.pin();
+    ///
+    /// pinned.insert(1, "a");
+    /// assert_eq!(pinned.get(&1), Some(&"a"));
+    /// assert_eq!(pinned.get(&2), None);
+    /// ```
+    pub fn get<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.map.get(key, &self.guard)
+    }
     /// Returns `true` if the map contains a value for the specified key.
     ///
     /// The key may be any borrowed form of the map's key type, but
@@ -134,7 +170,14 @@ where
     {
         self.map.contains_key(key, &self.guard)
     }
+}
 
+impl<'map, K, V, S> Pinned<'map, K, V, S>
+where
+    V: Send + Sync,
+    K: Hash + Eq + Send + Sync + Clone,
+    S: BuildHasher,
+{
     /// Inserts a key-value pair into the map.
     ///
     /// If the map did not have this key present, [`None`] is returned.
@@ -205,42 +248,6 @@ where
     pub fn clear(&self) {
         self.map.clear(&self.guard)
     }
-
-    /// Returns the number of elements in the map.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_dictionary::HashMap;
-    ///
-    /// let a = HashMap::new();
-    /// let pinned = a.pin();
-    ///
-    /// assert_eq!(pinned.len(), 0);
-    /// pinned.insert(1, "a");
-    /// assert_eq!(pinned.len(), 1);
-    /// ```
-    pub fn len(&self) -> usize {
-        self.map.len(&self.guard)
-    }
-
-    /// Returns `true` if the map contains no elements.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_dictionary::HashMap;
-    ///
-    /// let a = HashMap::new();
-    /// let pinned = a.pin();
-    ///
-    /// assert!(pinned.is_empty());
-    /// pinned.insert(1, "a");
-    /// assert!(!pinned.is_empty());
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty(&self.guard)
-    }
 }
 
 impl<K, V, S> Clone for Pinned<'_, K, V, S> {
@@ -251,8 +258,7 @@ impl<K, V, S> Clone for Pinned<'_, K, V, S> {
 
 impl<K, Q, V, S> Index<&'_ Q> for Pinned<'_, K, V, S>
 where
-    K: Borrow<Q> + Hash + Eq + Send + Sync + Clone,
-    V: Send + Sync,
+    K: Borrow<Q> + Hash + Eq,
     Q: Hash + Ord + ?Sized,
     S: BuildHasher,
 {
@@ -261,4 +267,45 @@ where
     fn index(&self, key: &Q) -> &V {
         self.get(key).expect("no entry found for key")
     }
+}
+
+impl<K, V, S> PartialEq for Pinned<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        HashMap::eq_pinned(&self, &other)
+    }
+}
+
+impl<K, V, S> PartialEq<HashMap<K, V, S>> for Pinned<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &HashMap<K, V, S>) -> bool {
+        *self == other.pin()
+    }
+}
+
+impl<K, V, S> PartialEq<Pinned<'_, K, V, S>> for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Pinned<'_, K, V, S>) -> bool {
+        self.pin() == *other
+    }
+}
+
+impl<K, V, S> Eq for Pinned<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+{
 }

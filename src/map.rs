@@ -151,6 +151,10 @@ impl<K, V, S> HashMap<K, V, S> {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
+    fn guard(&self) -> Guard {
+        self.collector.register().pin()
+    }
+
     /// Returns a reference to the map pinned to the current thread.
     ///
     /// The only way to access a map is through a pinned reference, which,
@@ -158,7 +162,7 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn pin(&self) -> Pinned<'_, K, V, S> {
         Pinned {
             map: self,
-            guard: self.collector.register().pin(),
+            guard: self.guard(),
         }
     }
 
@@ -166,6 +170,7 @@ impl<K, V, S> HashMap<K, V, S> {
     pub(crate) fn len(&self, guard: &Guard) -> usize {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
 
+        // TODO: is this too slow? should we store a cached total length?
         unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
             .iter()
             .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
@@ -357,8 +362,8 @@ where
                     continue;
                 }
 
+                // Try to find this key in the bucket
                 let mut curr = table.buckets.get(bucket_index as usize);
-
                 loop {
                     let node_ptr = match curr {
                         Some(node_ptr) => node_ptr,
@@ -371,10 +376,15 @@ where
                         None => break,
                     };
 
+                    // If the key already exists, update the value.
                     if hash == node.hash && node.key == key {
+                        // Here we create a new node instead of updating the value atomically.
+                        //
+                        // This is a tradeoff, we don't have to do atomic loads on reads,
+                        // but we have to do an extra allocation here for the node.
                         let new_node = Node {
-                            next: node.next.clone(),
                             key,
+                            next: node.next.clone(),
                             value: NonNull::from(Box::leak(Box::new(value))),
                             hash,
                         };
@@ -411,6 +421,11 @@ where
                         + 1
                 };
 
+                // If the number of elements guarded by this lock has exceeded the budget, resize
+                // the hash table.
+                //
+                // It is also possible that GrowTable will increase the budget but won't resize the
+                // hash table, if it is being poorly utilized due to a bad hash function.
                 if count > self.budget.load(Ordering::SeqCst) {
                     should_resize = true;
                 }
@@ -532,6 +547,9 @@ where
     /// the `table` instance that holds the buckets of buckets deemed too small must
     /// be passed as an argument. `resize` obtains a lock, and then checks if the
     /// buckets has been replaced in the meantime or not.
+    ///
+    /// This function may not resize the table if it values are found to be poorly
+    /// distributed across buckets. Instead the budget will be increased.
     fn resize<'g>(&'g self, table_ptr: Shared<'g, Table<K, V>>, guard: &'g Guard) {
         let table = unsafe { table_ptr.deref() };
 
@@ -849,14 +867,14 @@ where
     fn clone(&self) -> HashMap<K, V, S> {
         let self_pinned = self.pin();
 
-        let cloned = Self::with_capacity_and_hasher(self_pinned.len(), self.build_hasher.clone());
-        let cloned_pin = cloned.pin();
+        let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.build_hasher.clone());
+        let clone_pinned = clone.pin();
 
         for (k, v) in self_pinned.iter() {
-            cloned_pin.insert(k.clone(), v.clone());
+            clone_pinned.insert(k.clone(), v.clone());
         }
 
-        cloned
+        clone
     }
 }
 
@@ -867,6 +885,41 @@ where
     fn default() -> Self {
         Self::with_hasher(S::default())
     }
+}
+
+impl<K, V, S> HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    pub(crate) fn eq_pinned(this: &Pinned<'_, K, V, S>, other: &Pinned<'_, K, V, S>) -> bool {
+        if this.len() != other.len() {
+            return false;
+        }
+
+        this.iter()
+            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
+    }
+}
+
+impl<K, V, S> PartialEq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.pin() == other.pin()
+    }
+}
+
+impl<K, V, S> Eq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+{
 }
 
 #[cfg(test)]
