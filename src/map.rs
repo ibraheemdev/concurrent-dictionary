@@ -153,6 +153,172 @@ where
     }
 }
 
+impl<K, V, S> HashMap<K, V, S> {
+    /// Returns a reference to the map pinned to the current thread.
+    ///
+    /// The only way to access a map is through a pinned reference, which,
+    /// when dropped, will trigger garbage collection.
+    pub fn pin(&self) -> Pinned<'_, K, V, S> {
+        Pinned {
+            map: self,
+            guard: self.collector.register().pin(),
+        }
+    }
+
+    /// Returns the number of elements in the map.
+    pub(crate) fn len(&self, guard: &Guard) -> usize {
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+
+        unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
+            .iter()
+            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
+    }
+
+    /// Returns `true` if the map contains no elements.
+    pub(crate) fn is_empty(&self, guard: &Guard) -> bool {
+        self.len(guard) == 0
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        Iter {
+            size: self.len(guard),
+            current_node: table.buckets.get(0),
+            table,
+            current_bucket: 0,
+            guard,
+        }
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    pub(crate) fn keys<'g>(&self, guard: &'g Guard) -> Keys<'g, K, V> {
+        Keys {
+            iter: self.iter(guard),
+        }
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    pub(crate) fn values<'g>(&self, guard: &'g Guard) -> Values<'g, K, V> {
+        Values {
+            iter: self.iter(guard),
+        }
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    /// Returns a reference to the value corresponding to the key.
+    pub(crate) fn get<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        let hash = self.hash(key);
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        let bucket_index = bucket_index(hash, table.buckets.len() as _);
+
+        let mut node_ptr = table.buckets.get(bucket_index as usize);
+
+        while let Some(node) = node_ptr {
+            // Look Ma, no lock!
+            //
+            // The atomic load ensures that we have a valid reference to
+            // table.buckets[bucket_index]. This protects us from reading
+            // node fields of different instances.
+            let node = match unsafe { node.load(Ordering::Acquire, guard).as_ref() } {
+                Some(node) => node,
+                None => break,
+            };
+
+            if node.hash == hash && node.key.borrow() == key {
+                return Some(unsafe { node.value.as_ref() });
+            }
+
+            node_ptr = Some(&node.next);
+        }
+
+        None
+    }
+
+    /// Returns `true` if the map contains a value for the specified key.
+    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &Guard) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.get(key, &guard).is_some()
+    }
+
+    /// Acquires all locks for this hash buckets.
+    fn lock_all<'g>(&'g self, guard: &'g Guard) -> (impl Drop + 'g, impl Drop + 'g) {
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        let locks = &table.locks;
+
+        // Acquire the first lock.
+        let _guard = self.lock_range(0..1, guard);
+
+        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
+        // and so we can safely read locks.len().
+        let _guard_rest = self.lock_range(1..locks.len(), guard);
+
+        (_guard, _guard_rest)
+    }
+
+    /// Acquires a contiguous range of locks for this hash buckets.
+    fn lock_range<'g>(&'g self, range: Range<usize>, guard: &'g Guard) -> impl Drop + 'g {
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
+        let locks = &table.locks;
+
+        for i in range.clone() {
+            unsafe {
+                locks[i].raw().lock();
+            }
+        }
+
+        /// Unlocks the specified locks on drop.
+        struct Unlock<'g, K, V, S> {
+            map: &'g HashMap<K, V, S>,
+            guard: &'g Guard,
+            range: Range<usize>,
+        }
+
+        impl<K, V, S> Drop for Unlock<'_, K, V, S> {
+            fn drop(&mut self) {
+                let table = unsafe { self.map.table.load(Ordering::Acquire, self.guard).deref() };
+                let locks = &table.locks;
+
+                for i in self.range.clone() {
+                    unsafe {
+                        locks[i].raw().unlock();
+                    }
+                }
+            }
+        }
+
+        Unlock {
+            map: self,
+            guard,
+            range,
+        }
+    }
+
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Hash + ?Sized,
+    {
+        let mut h = self.build_hasher.build_hasher();
+        key.hash(&mut h);
+        h.finish()
+    }
+}
+
+// methods that required K/V: Send + Sync, as they potentially call
+// `defer_destroy` on keys and values, and the garbage collector
+// may execute the destructors on another thread
 impl<K, V, S> HashMap<K, V, S>
 where
     V: Send + Sync,
@@ -164,17 +330,6 @@ where
 
     /// The maximum size of the `locks` array.
     const MAX_LOCKS: usize = 1024;
-
-    /// Returns a reference to the map pinned to the current thread.
-    ///
-    /// The only way to access a map is through a pinned reference, which,
-    /// when dropped, will trigger garbage collection.
-    pub fn pin(&self) -> Pinned<'_, K, V, S> {
-        Pinned {
-            map: self,
-            guard: self.collector.register().pin(),
-        }
-    }
 
     /// Inserts a key-value pair into the map.
     ///
@@ -278,48 +433,6 @@ where
         }
     }
 
-    /// Returns a reference to the value corresponding to the key.
-    pub(crate) fn get<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let hash = self.hash(key);
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let bucket_index = bucket_index(hash, table.buckets.len() as _);
-
-        let mut node_ptr = table.buckets.get(bucket_index as usize);
-
-        while let Some(node) = node_ptr {
-            // Look Ma, no lock!
-            //
-            // The atomic load ensures that we have a valid reference to
-            // table.buckets[bucket_index]. This protects us from reading
-            // node fields of different instances.
-            let node = match unsafe { node.load(Ordering::Acquire, guard).as_ref() } {
-                Some(node) => node,
-                None => break,
-            };
-
-            if node.hash == hash && node.key.borrow() == key {
-                return Some(unsafe { node.value.as_ref() });
-            }
-
-            node_ptr = Some(&node.next);
-        }
-
-        None
-    }
-
-    /// Returns `true` if the map contains a value for the specified key.
-    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &Guard) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.get(key, &guard).is_some()
-    }
-
     /// Removes a key from the map, returning the value at the key if the key
     /// was previously in the map.
     pub(crate) fn remove<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
@@ -410,49 +523,10 @@ where
         self.table.store(Owned::new(new_table), Ordering::Release);
         self.budget.store(1.max(new_budget), Ordering::SeqCst);
 
+        // TODO: destroy everything
         unsafe {
             guard.defer_destroy(table_ptr);
         };
-    }
-
-    /// Returns the number of elements in the map.
-    pub(crate) fn len(&self, guard: &Guard) -> usize {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-
-        unsafe { table.count_per_lock.load(Ordering::Acquire, guard) }
-            .iter()
-            .fold(0, |acc, c| acc + c.load(Ordering::Relaxed))
-    }
-
-    /// Returns `true` if the map contains no elements.
-    pub(crate) fn is_empty(&self, guard: &Guard) -> bool {
-        self.len(guard) == 0
-    }
-
-    /// An iterator visiting all key-value pairs in arbitrary order.
-    pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        Iter {
-            size: self.len(guard),
-            current_node: table.buckets.get(0),
-            table,
-            current_bucket: 0,
-            guard,
-        }
-    }
-
-    /// An iterator visiting all keys in arbitrary order.
-    pub(crate) fn keys<'g>(&self, guard: &'g Guard) -> Keys<'g, K, V> {
-        Keys {
-            iter: self.iter(guard),
-        }
-    }
-
-    /// An iterator visiting all values in arbitrary order.
-    pub(crate) fn values<'g>(&self, guard: &'g Guard) -> Values<'g, K, V> {
-        Values {
-            iter: self.iter(guard),
-        }
     }
 
     /// Replaces the bucket buckets with a larger one.
@@ -614,68 +688,6 @@ where
             guard.defer_destroy(table_ptr);
         }
     }
-
-    /// Acquires all locks for this hash buckets.
-    fn lock_all<'g>(&'g self, guard: &'g Guard) -> (impl Drop + 'g, impl Drop + 'g) {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let locks = &table.locks;
-
-        // Acquire the first lock.
-        let _guard = self.lock_range(0..1, guard);
-
-        // Now that we have the first lock, the locks array cannnot change (i.e., be resized),
-        // and so we can safely read locks.len().
-        let _guard_rest = self.lock_range(1..locks.len(), guard);
-
-        (_guard, _guard_rest)
-    }
-
-    /// Acquires a contiguous range of locks for this hash buckets.
-    fn lock_range<'g>(&'g self, range: Range<usize>, guard: &'g Guard) -> impl Drop + 'g {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).deref() };
-        let locks = &table.locks;
-
-        for i in range.clone() {
-            unsafe {
-                locks[i].raw().lock();
-            }
-        }
-
-        /// Unlocks the specified locks on drop.
-        struct Unlock<'g, K, V, S> {
-            map: &'g HashMap<K, V, S>,
-            guard: &'g Guard,
-            range: Range<usize>,
-        }
-
-        impl<K, V, S> Drop for Unlock<'_, K, V, S> {
-            fn drop(&mut self) {
-                let table = unsafe { self.map.table.load(Ordering::Acquire, self.guard).deref() };
-                let locks = &table.locks;
-
-                for i in self.range.clone() {
-                    unsafe {
-                        locks[i].raw().unlock();
-                    }
-                }
-            }
-        }
-
-        Unlock {
-            map: self,
-            guard,
-            range,
-        }
-    }
-
-    fn hash<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        let mut h = self.build_hasher.build_hasher();
-        key.hash(&mut h);
-        h.finish()
-    }
 }
 
 /// An iterator over the entries of a `HashMap`.
@@ -731,6 +743,18 @@ impl<'g, K, V> Iterator for Iter<'g, K, V> {
     }
 }
 
+impl<K, V> Clone for Iter<'_, K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table,
+            guard: self.guard,
+            current_node: self.current_node,
+            current_bucket: self.current_bucket,
+            size: self.size,
+        }
+    }
+}
+
 /// An iterator over the keys of a `HashMap`.
 ///
 /// This `struct` is created by the [`keys`] method on [`HashMap`]. See its
@@ -759,6 +783,14 @@ impl<'g, K, V> Iterator for Keys<'g, K, V> {
     }
 }
 
+impl<K, V> Clone for Keys<'_, K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+        }
+    }
+}
+
 /// An iterator over the values of a `HashMap`.
 ///
 /// This `struct` is created by the [`values`] method on [`HashMap`]. See its
@@ -784,6 +816,14 @@ impl<'g, K, V> Iterator for Values<'g, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> Clone for Values<'_, K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+        }
     }
 }
 

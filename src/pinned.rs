@@ -243,6 +243,12 @@ where
     }
 }
 
+impl<K, V, S> Clone for Pinned<'_, K, V, S> {
+    fn clone(&self) -> Self {
+        self.map.pin()
+    }
+}
+
 impl<K, Q, V, S> Index<&'_ Q> for Pinned<'_, K, V, S>
 where
     K: Borrow<Q> + Hash + Eq + Send + Sync + Clone,
