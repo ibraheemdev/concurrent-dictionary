@@ -536,49 +536,59 @@ where
 
     /// Clears the map, removing all key-value pairs.
     pub(crate) fn clear(&self, guard: &Guard) {
-        let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
-            Some(table) => table,
-            None => return,
-        };
+        loop {
+            let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+                Some(table) => table,
+                None => return,
+            };
 
-        let _guard = self.lock_all(table);
+            let _guard = self.lock_all(table);
 
-        let new_table = Table {
-            buckets: vec![].into_boxed_slice(),
-            locks: table.locks.clone(),
-            count_per_lock: AtomicArrayBuilder::from_fn(|| AtomicUsize::new(0), table.locks.len())
+            // Make sure the table didn't change while we were waiting for the lock.
+            if Shared::from(table as *const _) != self.table.load(Ordering::Acquire, guard) {
+                continue;
+            }
+
+            let new_table = Table {
+                buckets: vec![].into_boxed_slice(),
+                locks: table.locks.clone(),
+                count_per_lock: AtomicArrayBuilder::from_fn(
+                    || AtomicUsize::new(0),
+                    table.locks.len(),
+                )
                 .build(),
-        };
+            };
 
-        let new_budget = new_table.buckets.len() / new_table.locks.len();
+            let new_budget = new_table.buckets.len() / new_table.locks.len();
 
-        self.table.store(Owned::new(new_table), Ordering::Release);
-        self.budget.store(1.max(new_budget), Ordering::SeqCst);
+            self.table.store(Owned::new(new_table), Ordering::Release);
+            self.budget.store(1.max(new_budget), Ordering::SeqCst);
 
-        // walk through the table buckets, and set each initial node to null, destroying the rest
-        // of the nodes and values.
-        for i in 0..table.len(guard) {
-            let node_ptr = table.buckets.get(i).unwrap();
-            let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
+            // walk through the table buckets, and set each initial node to null, destroying the rest
+            // of the nodes and values.
+            for i in 0..table.len(guard) {
+                let node_ptr = table.buckets.get(i).unwrap();
+                let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
 
-            if let Some(node) = node {
-                node_ptr.store(Shared::null(), Ordering::Release);
+                if let Some(node) = node {
+                    node_ptr.store(Shared::null(), Ordering::Release);
 
-                unsafe {
-                    guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
-                }
-
-                let mut next = &node.next;
-                while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
                     unsafe {
-                        guard.defer_destroy(Shared::from(node as *const _));
                         guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
                     }
 
-                    next = &node.next;
+                    let mut next = &node.next;
+                    while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
+                        unsafe {
+                            guard.defer_destroy(Shared::from(node as *const _));
+                            guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
+                        }
+
+                        next = &node.next;
+                    }
+                } else {
+                    // the node was already null, and we don't have to do anything
                 }
-            } else {
-                // the node was already null, and we don't have to do anything
             }
         }
     }
