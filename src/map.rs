@@ -129,6 +129,24 @@ impl<K, V> HashMap<K, V, RandomState> {
     pub fn new() -> Self {
         Self::with_hasher(RandomState::new())
     }
+
+    /// Creates an empty `HashMap` with the specified capacity.
+    ///
+    ///
+    /// Setting an initial capacity is a best practice if you know a size estimate
+    /// up front. However, there is no guarantee that the `HashMap` will not resize
+    /// if `capacity` elements are inserted. The map will resize based on key collision,
+    /// so bad key distribution may cause a resize before `capacity` is reached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use seize::HashMap;
+    /// let map: HashMap<&str, i32> = HashMap::with_capacity(10);
+    /// ```
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, RandomState::new())
+    }
 }
 
 impl<K, V, S> HashMap<K, V, S> {
@@ -240,6 +258,16 @@ impl<K, V, S> HashMap<K, V, S> {
 
         match table {
             Some(table) => table.len(),
+            None => 0,
+        }
+    }
+
+    /// Returns the number of elements the map can hold without reallocating.
+    pub(crate) fn capacity(&self, guard: &Guard) -> usize {
+        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
+
+        match table {
+            Some(table) => table.buckets.len(),
             None => 0,
         }
     }
@@ -709,7 +737,7 @@ where
             new_locks = Some(locks);
         }
 
-        let new_count_per_lock = std::iter::repeat_with(Default::default)
+        let new_counts = std::iter::repeat_with(Default::default)
             .take(new_locks_len)
             .collect::<Vec<AtomicUsize>>();
 
@@ -727,8 +755,8 @@ where
             while let Some(node) = current {
                 let next = unsafe { node.next.load(Ordering::Acquire, guard).as_ref() };
 
-                let new_bucket_index = bucket_index(node.hash, new_buckets.capacity() as _);
-                let new_lock_index = lock_index(new_bucket_index, table.locks.len() as _);
+                let new_bucket_index = bucket_index(node.hash, new_len as _);
+                let new_lock_index = lock_index(new_bucket_index, new_locks_len as _);
 
                 new_buckets[new_bucket_index as usize] = Atomic::new(Node {
                     key: node.key.clone(),
@@ -737,16 +765,14 @@ where
                     hash: node.hash,
                 });
 
-                new_count_per_lock[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
+                new_counts[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
 
                 current = next;
             }
         }
 
-        self.budget.store(
-            1.max(new_buckets.capacity() / new_locks_len),
-            Ordering::SeqCst,
-        );
+        self.budget
+            .store(1.max(new_len / new_locks_len), Ordering::SeqCst);
 
         self.table.store(
             Owned::new(Table {
@@ -754,7 +780,7 @@ where
                 locks: new_locks
                     .map(Arc::from)
                     .unwrap_or_else(|| table.locks.clone()),
-                counts: new_count_per_lock.into_boxed_slice(),
+                counts: new_counts.into_boxed_slice(),
             }),
             Ordering::Release,
         );

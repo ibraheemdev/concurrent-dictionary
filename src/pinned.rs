@@ -99,6 +99,25 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
         self.map.len(&self.guard)
     }
 
+    /// Returns the number of elements the map can hold without
+    /// reallocating.
+    ///
+    /// There is no guarantee that the `HashMap` will not
+    /// resize if `capacity` elements are inserted. The map will resize
+    /// based on key collision, so bad key distribution may cause a
+    /// resize before `capacity` is reached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use seize::HashMap;
+    /// let map: HashMap<i32, i32> = HashMap::with_capacity(100);
+    /// assert!(map.pin().capacity() >= 100);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.map.capacity(&self.guard)
+    }
+
     /// Returns `true` if the map contains no elements.
     ///
     /// # Examples
