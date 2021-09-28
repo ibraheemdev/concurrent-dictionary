@@ -14,6 +14,3 @@ function plot {
 plot ReadHeavy.fx
 plot Exchange.fx
 plot RapidGrow.fx
-plot ReadHeavy.std
-plot Exchange.std
-plot RapidGrow.std
