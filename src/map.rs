@@ -1,4 +1,4 @@
-use crate::Pinned;
+use crate::{resize, Pinned};
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -150,20 +150,6 @@ impl<K, V> HashMap<K, V, RandomState> {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-    /// The maximum # of buckets the buckets can hold.
-    const MAX_BUCKETS: usize = isize::MAX as _;
-
-    /// The hash-table will be resized to this amount on the first insert
-    /// unless a non-zero capacity is specified upon creation.
-    const DEFAULT_BUCKETS: usize = 31;
-
-    /// The maximum size of the `locks` array.
-    const MAX_LOCKS: usize = 1024;
-
-    fn default_locks() -> usize {
-        num_cpus::get()
-    }
-
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
     ///
@@ -228,12 +214,11 @@ impl<K, V, S> HashMap<K, V, S> {
             return Self::with_hasher(hash_builder);
         }
 
-        // TODO: calculate lock count from capacity here and in `init_table`
-        let lock_count = Self::default_locks();
+        let lock_count = resize::initial_locks(capacity);
 
         Self {
             resize: Arc::new(Mutex::new(())),
-            budget: AtomicUsize::new(capacity / lock_count),
+            budget: AtomicUsize::new(resize::budget(capacity, lock_count)),
             table: Atomic::new(Table::new(capacity, lock_count)),
             collector: Collector::new(),
             hash_builder,
@@ -259,16 +244,6 @@ impl<K, V, S> HashMap<K, V, S> {
 
         match table {
             Some(table) => table.len(),
-            None => 0,
-        }
-    }
-
-    /// Returns the number of elements the map can hold without reallocating.
-    pub(crate) fn capacity(&self, guard: &Guard) -> usize {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
-
-        match table {
-            Some(table) => table.buckets.len(),
             None => 0,
         }
     }
@@ -309,14 +284,12 @@ impl<K, V, S> HashMap<K, V, S> {
     fn init_table<'g>(&'g self, capacity: Option<usize>, guard: &'g Guard) -> &'g Table<K, V> {
         let _guard = self.resize.lock();
 
+        let capacity = capacity.unwrap_or(resize::DEFAULT_BUCKETS);
         match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
             Some(table) => table,
             None => {
-                let new_table = Owned::new(Table::new(
-                    capacity.unwrap_or(Self::DEFAULT_BUCKETS),
-                    Self::default_locks(),
-                ))
-                .into_shared(guard);
+                let new_table = Owned::new(Table::new(capacity, resize::initial_locks(capacity)))
+                    .into_shared(guard);
 
                 self.table.store(new_table, Ordering::Release);
                 unsafe { new_table.deref() }
@@ -345,10 +318,6 @@ where
 
         while let Some(node) = node_ptr {
             // Look Ma, no lock!
-            //
-            // The atomic load ensures that we have a valid reference to
-            // table.buckets[bucket_index]. This protects us from reading
-            // node fields of different instances.
             let node = match unsafe { node.load(Ordering::Acquire, guard).as_ref() } {
                 Some(node) => node,
                 None => break,
@@ -586,6 +555,12 @@ where
         for i in 0..table.counts.len() {
             table.counts[i].store(0, Ordering::Release);
         }
+
+        if let Some(budget) = resize::clear_budget(table.buckets.len(), table.locks.len()) {
+            // store the new budget, which might be different if the map was
+            // badly distributed
+            self.budget.store(budget, Ordering::SeqCst);
+        }
     }
 
     /// Reserves capacity for at least additional more elements to be inserted in the `HashMap`.
@@ -625,79 +600,39 @@ where
             return;
         }
 
-        let mut overflowed = false;
-        let mut new_len = match new_len {
-            Some(len) => len,
-            None => {
-                let approx_len = table.len();
+        let current_locks = table.locks.len();
 
-                // If the bucket array is too empty, double the budget instead of resizing the table
-                if approx_len < table.buckets.len() / 4 {
+        let (new_len, new_locks_len, new_budget) = match new_len {
+            Some(len) => {
+                let locks = resize::new_locks(len, current_locks);
+                let budget = resize::budget(len, locks.unwrap_or(current_locks));
+                (len, locks, budget)
+            }
+            None => match resize::resize(table.buckets.len(), current_locks, table.len()) {
+                resize::Resize::Resize {
+                    buckets,
+                    locks,
+                    budget,
+                } => (buckets, locks, budget),
+                resize::Resize::DoubleBudget => {
                     let budget = self.budget.load(Ordering::SeqCst);
                     self.budget.store(budget * 2, Ordering::SeqCst);
+                    return;
                 }
-
-                let mut new_len = 0;
-
-                // Compute the new buckets size.
-                //
-                // The current method is to find the smallest integer that is:
-                //
-                // 1) larger than twice the previous buckets size
-                // 2) not divisible by 2, 3, 5 or 7.
-                //
-                // This may change in the future.
-                let mut compute_new_len = || {
-                    // Double the size of the buckets buckets and add one, so that we have an odd integer.
-                    new_len = table.buckets.len().checked_mul(2)?.checked_add(1)?;
-
-                    // Now, we only need to check odd integers, and find the first that is not divisible
-                    // by 3, 5 or 7.
-                    while new_len.checked_rem(3)? == 0
-                        || new_len.checked_rem(5)? == 0
-                        || new_len.checked_rem(7)? == 0
-                    {
-                        new_len = new_len.checked_add(2)?;
-                    }
-
-                    debug_assert!(new_len % 2 != 0);
-
-                    Some(())
-                };
-
-                match compute_new_len() {
-                    Some(()) => {}
-                    None => {
-                        overflowed = true;
-                    }
-                }
-
-                new_len
-            }
+            },
         };
 
-        if overflowed || new_len > Self::MAX_BUCKETS {
-            new_len = Self::MAX_BUCKETS;
-
-            // Set the budget to `usize::MAX` to make sure `resize`
-            // is never called again (unless the buckets is shrunk), because
-            // the buckets is at it's maximum size.
-            self.budget.store(usize::MAX, Ordering::SeqCst);
-        }
-
         let mut new_locks = None;
-        let mut new_locks_len = table.locks.len();
 
         // Add more locks to account for the new buckets.
-        if table.locks.len() < Self::MAX_LOCKS {
-            new_locks_len = table.locks.len() * 2;
-            let mut locks = Vec::with_capacity(new_locks_len);
+        if let Some(len) = new_locks_len {
+            let mut locks = Vec::with_capacity(len);
 
-            for i in 0..table.locks.len() {
+            for i in 0..current_locks {
                 locks.push(table.locks[i].clone());
             }
 
-            for _ in table.locks.len()..locks.len() {
+            for _ in current_locks..len {
                 locks.push(Arc::new(Mutex::new(())));
             }
 
@@ -705,7 +640,7 @@ where
         }
 
         let new_counts = std::iter::repeat_with(Default::default)
-            .take(new_locks_len)
+            .take(new_locks_len.unwrap_or(current_locks))
             .collect::<Vec<AtomicUsize>>();
 
         let mut new_buckets = std::iter::repeat_with(Default::default)
@@ -721,7 +656,10 @@ where
 
             while let Some(node) = unsafe { current.load(Ordering::Acquire, guard).as_ref() } {
                 let new_bucket_index = bucket_index(node.hash, new_len as _);
-                let new_lock_index = lock_index(new_bucket_index, new_locks_len as _);
+                let new_lock_index = lock_index(
+                    new_bucket_index,
+                    new_locks_len.unwrap_or(current_locks) as _,
+                );
 
                 new_buckets[new_bucket_index as usize] = Atomic::new(Node {
                     key: node.key.clone(),
@@ -740,8 +678,7 @@ where
             }
         }
 
-        self.budget
-            .store(1.max(new_len / new_locks_len), Ordering::SeqCst);
+        self.budget.store(new_budget, Ordering::SeqCst);
 
         self.table.store(
             Owned::new(Table {
