@@ -6,7 +6,6 @@ pub const DEFAULT_BUCKETS: usize = 31;
 const MAX_BUCKETS: usize = isize::MAX as _;
 
 /// The maximum size of the `locks` array.
-/// TODO max this out like dashmap
 const MAX_LOCKS: usize = 1024;
 
 pub enum Resize {
@@ -95,13 +94,15 @@ pub fn initial_locks(buckets: usize) -> usize {
 }
 
 pub fn new_locks(buckets: usize, current_locks: usize) -> Option<usize> {
-    (current_locks != MAX_LOCKS).then(|| match buckets {
+    let locks = match buckets {
         0..=67 => 8,
         68..=137 => 16,
         138..=277 => 32,
         278..=557 => 64,
         558..=1117 => 128,
         1118..=2237 => 512,
-        _ => 1024,
-    })
+        _ => MAX_LOCKS,
+    };
+
+    (current_locks != locks).then(|| locks)
 }

@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{fmt, ptr};
+use std::{fmt, mem, ptr};
 
 use crossbeam_epoch::{Atomic, Collector, Guard, Owned, Shared};
 use lock_api::RawMutex;
@@ -416,7 +416,11 @@ where
 
                         unsafe {
                             guard.defer_destroy(Shared::from(node as *const _));
-                            guard.defer_destroy(Shared::from(old_val as *const _));
+
+                            let ptr = node.value.as_ptr();
+                            guard.defer_unchecked(move || {
+                                let _ = Box::from_raw(ptr);
+                            });
                         };
 
                         return Some(old_val);
@@ -501,7 +505,11 @@ where
 
                         unsafe {
                             guard.defer_destroy(Shared::from(node as *const _));
-                            guard.defer_destroy(Shared::from(val as *const _));
+
+                            let ptr = node.value.as_ptr();
+                            guard.defer_unchecked(move || {
+                                let _ = Box::from_raw(ptr);
+                            });
                         }
 
                         return Some(val);
@@ -525,29 +533,37 @@ where
             None => return,
         };
 
-        // walk through the table buckets, and set each initial node to null, destroying the rest
-        // of the nodes and values.
-        for i in 0..table.len() {
-            let node_ptr = &table.buckets[i];
-            let node = unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() };
+        for bucket_ptr in table.buckets.iter() {
+            match unsafe { bucket_ptr.load(Ordering::Acquire, guard).as_ref() } {
+                Some(bucket) => {
+                    // set the bucket to null
+                    bucket_ptr.store(Shared::null(), Ordering::Release);
 
-            // if the node is already null we don't have to do anything
-            if let Some(node) = node {
-                node_ptr.store(Shared::null(), Ordering::Release);
-
-                unsafe {
-                    guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
-                }
-
-                let mut next = &node.next;
-                while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
+                    // drop the value
                     unsafe {
-                        guard.defer_destroy(Shared::from(node as *const _));
-                        guard.defer_destroy(Shared::from(node.value.as_ref() as *const _));
+                        let ptr = bucket.value.as_ptr();
+                        guard.defer_unchecked(move || {
+                            let _ = Box::from_raw(ptr);
+                        });
                     }
 
-                    next = &node.next;
+                    // drop the rest of  nodes and values
+                    let mut next = &bucket.next;
+                    while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
+                        unsafe {
+                            guard.defer_destroy(Shared::from(node as *const _));
+
+                            let ptr = node.value.as_ptr();
+                            guard.defer_unchecked(move || {
+                                let _ = Box::from_raw(ptr);
+                            });
+                        }
+
+                        next = &node.next;
+                    }
                 }
+                // the bucket is already null
+                None => return,
             }
         }
 
@@ -648,7 +664,7 @@ where
             .collect::<Vec<Atomic<_>>>();
 
         // Now lock the rest of the buckets to make sure nothing is modified while resizing.
-        let _guard_rest = table.lock_range(1..table.locks.len());
+        let _guard_rest = table.lock_range(0..table.locks.len());
 
         // Copy all data into a new buckets, creating new nodes for all elements.
         for i in 0..table.buckets.len() {
@@ -730,6 +746,33 @@ fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
     debug_assert!(lock_index < lock_count);
 
     lock_index
+}
+
+impl<K, V, S> Drop for HashMap<K, V, S> {
+    fn drop(&mut self) {
+        let guard = unsafe { crossbeam_epoch::unprotected() };
+
+        let table = self.table.load(Ordering::Relaxed, &guard);
+
+        // table was never allocated
+        if table.is_null() {
+            return;
+        }
+
+        let mut table = unsafe { table.into_owned() };
+
+        // drop all nodes and values
+        for bucket in table.buckets.iter_mut().map(mem::take) {
+            let mut node = bucket;
+
+            while !unsafe { node.load(Ordering::Acquire, guard).is_null() } {
+                let mut d = unsafe { node.into_owned() };
+                let _ = unsafe { Box::from_raw(d.value.as_ptr()) };
+
+                node = mem::take(&mut d.next);
+            }
+        }
+    }
 }
 
 unsafe impl<K, V, S> Send for HashMap<K, V, S>
@@ -1039,5 +1082,6 @@ mod tests {
         ]
         .iter()
         .all(|&l| l == 100));
+        drop(map);
     }
 }
