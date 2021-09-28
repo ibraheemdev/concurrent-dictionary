@@ -35,8 +35,6 @@ pub fn resize(current_buckets: usize, current_locks: usize, current_len: usize) 
     //
     // 1) larger than twice the previous buckets size
     // 2) not divisible by 2, 3, 5 or 7.
-    //
-    // This may change in the future.
     let compute_new_len = || {
         // Double the size of the buckets buckets and add one, so that we have an odd integer.
         let mut new_len = current_buckets.checked_mul(2)?.checked_add(1)?;
@@ -95,13 +93,15 @@ pub fn initial_locks(buckets: usize) -> usize {
 }
 
 pub fn new_locks(buckets: usize, current_locks: usize) -> Option<usize> {
-    (current_locks != MAX_LOCKS).then(|| match buckets {
+    let locks = match buckets {
         0..=67 => 8,
         68..=137 => 16,
         138..=277 => 32,
         278..=557 => 64,
         558..=1117 => 128,
         1118..=2237 => 512,
-        _ => 1024,
-    })
+        _ => MAX_LOCKS,
+    };
+
+    Some(locks).filter(|&l| l != current_locks)
 }

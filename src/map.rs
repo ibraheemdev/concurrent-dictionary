@@ -185,6 +185,26 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
+    pub(crate) fn build(
+        capacity: usize,
+        hash_builder: S,
+        collector: Collector,
+    ) -> HashMap<K, V, S> {
+        if capacity == 0 {
+            return Self::with_hasher(hash_builder);
+        }
+
+        let lock_count = resize::initial_locks(capacity);
+
+        Self {
+            resize: Arc::new(Mutex::new(())),
+            budget: AtomicUsize::new(resize::budget(capacity, lock_count)),
+            table: Atomic::new(Table::new(capacity, lock_count)),
+            collector,
+            hash_builder,
+        }
+    }
+
     /// Creates an empty `HashMap` with the specified capacity, using `hash_builder`
     /// to hash the keys.
     ///
@@ -210,19 +230,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        if capacity == 0 {
-            return Self::with_hasher(hash_builder);
-        }
-
-        let lock_count = resize::initial_locks(capacity);
-
-        Self {
-            resize: Arc::new(Mutex::new(())),
-            budget: AtomicUsize::new(resize::budget(capacity, lock_count)),
-            table: Atomic::new(Table::new(capacity, lock_count)),
-            collector: Collector::new(),
-            hash_builder,
-        }
+        Self::build(capacity, hash_builder, Collector::new())
     }
 }
 
@@ -303,14 +311,25 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    /// Returns a reference to the value corresponding to the key.
     pub(crate) fn get<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let hash = self.hash(key);
+        self.get_hashed(key, guard, self.hash(key))
+    }
 
+    /// Returns a reference to the value corresponding to the key.
+    pub(crate) fn get_hashed<'g, Q: ?Sized>(
+        &'g self,
+        key: &Q,
+        guard: &'g Guard,
+        hash: u64,
+    ) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
         let bucket_index = bucket_index(hash, table.buckets.len() as _);
@@ -361,6 +380,11 @@ where
     K: Hash + Eq + Send + Sync + Clone,
     S: BuildHasher,
 {
+    pub(crate) fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
+        let h = self.hash(&key);
+        self.insert_hashed(key, value, guard, h)
+    }
+
     /// Inserts a key-value pair into the map.
     ///
     /// If the map did not have this key present, [`None`] is returned.
@@ -368,8 +392,13 @@ where
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though; this matters for
     /// types that can be `==` without being identical.
-    pub(crate) fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
-        let hash = self.hash(&key);
+    pub(crate) fn insert_hashed<'g>(
+        &'g self,
+        key: K,
+        value: V,
+        guard: &'g Guard,
+        hash: u64,
+    ) -> Option<&'g V> {
         let mut should_resize = false;
 
         loop {
@@ -460,15 +489,26 @@ where
         }
     }
 
-    /// Removes a key from the map, returning the value at the key if the key
-    /// was previously in the map.
     pub(crate) fn remove<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let hash = self.hash(key);
+        self.remove_hashed(key, guard, self.hash(key))
+    }
 
+    /// Removes a key from the map, returning the value at the key if the key
+    /// was previously in the map.
+    pub(crate) fn remove_hashed<'g, Q: ?Sized>(
+        &'g self,
+        key: &Q,
+        guard: &'g Guard,
+        hash: u64,
+    ) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         loop {
             let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
@@ -648,7 +688,7 @@ where
             .collect::<Vec<Atomic<_>>>();
 
         // Now lock the rest of the buckets to make sure nothing is modified while resizing.
-        let _guard_rest = table.lock_range(1..table.locks.len());
+        let _guard_rest = table.lock_range(0..table.locks.len());
 
         // Copy all data into a new buckets, creating new nodes for all elements.
         for i in 0..table.buckets.len() {
