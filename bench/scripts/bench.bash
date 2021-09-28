@@ -31,6 +31,4 @@ function bench {
 }
 
 bench ReadHeavy fx
-bench Exchange fx
-bench RapidGrow fx
 date

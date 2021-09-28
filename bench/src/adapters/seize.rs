@@ -35,7 +35,7 @@ impl Clone for Value {
 #[derive(Clone)]
 pub struct SeizeTable<K, H>(Arc<seize::HashMap<K, Value, H>>);
 
-pub struct SeizeHandle<K: 'static, H: 'static>(seize::Pinned<'static, K, Value, H>);
+pub struct SeizeHandle<K: 'static, H: 'static>(&'static seize::HashMap<K, Value, H>);
 
 impl<H> Collection for SeizeTable<u64, H>
 where
@@ -51,7 +51,7 @@ where
     }
 
     fn pin(&self) -> Self::Handle {
-        SeizeHandle(unsafe { std::mem::transmute(self.0.pin()) })
+        SeizeHandle(unsafe { std::mem::transmute(&*self.0) })
     }
 }
 
@@ -62,19 +62,26 @@ where
     type Key = u64;
 
     fn get(&mut self, key: &Self::Key) -> bool {
-        self.0.get(key).is_some()
+        self.0.pin().get(key).is_some()
     }
 
     fn insert(&mut self, key: &Self::Key) -> bool {
-        self.0.insert(*key, Value(AtomicU64::new(0))).is_none()
+        self.0
+            .pin()
+            .insert(*key, Value(AtomicU64::new(0)))
+            .is_none()
     }
 
     fn remove(&mut self, key: &Self::Key) -> bool {
-        self.0.remove(key).is_some()
+        self.0.pin().remove(key).is_some()
     }
 
     fn update(&mut self, key: &Self::Key) -> bool {
-        self.0.get(key).map(|x| x.0.fetch_add(1, Relaxed)).is_some()
+        self.0
+            .pin()
+            .get(key)
+            .map(|x| x.0.fetch_add(1, Relaxed))
+            .is_some()
     }
 }
 

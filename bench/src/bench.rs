@@ -1,4 +1,4 @@
-use std::{collections::hash_map::RandomState, fmt::Debug, io, thread::sleep, time::Duration};
+use std::{fmt::Debug, io, thread::sleep, time::Duration};
 
 use bustle::*;
 use fxhash::FxBuildHasher;
@@ -107,7 +107,7 @@ fn run(options: &Options, h: &mut Handler) {
         case::<DashMapTable<u64, FxBuildHasher>>("FxDashMap", options, h);
         case::<SeizeTable<u64, FxBuildHasher>>("FxSeize", options, h);
         // case::<FlurryTable<u64, FxBuildHasher>>("FxFlurry", options, h);
-        case::<ShardedSeizeTable<u64, FxBuildHasher>>("FxShardedSeize", options, h);
+        // case::<ShardedSeizeTable<u64, FxBuildHasher>>("FxShardedSeize", options, h);
         // case::<EvmapTable<u64, FxBuildHasher>>("FxEvmap", options, h);
     }
 }

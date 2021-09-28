@@ -8,3 +8,7 @@ mod map;
 pub use map::{HashMap, Iter, Keys, Values};
 
 mod resize;
+
+mod sharded;
+pub use sharded::Sharded;
+pub use crossbeam_epoch::Guard;
