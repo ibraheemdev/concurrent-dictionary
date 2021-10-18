@@ -85,56 +85,56 @@ where
     }
 }
 
-pub struct ShardedSeizeTable<K, H>(Arc<seize::Sharded<K, Value, H>>);
-
-pub struct ShardedSeizeHandle<K: 'static, H: 'static>(
-    &'static seize::Sharded<K, Value, H>,
-    seize::Guard,
-);
-
-impl<H> Collection for ShardedSeizeTable<u64, H>
-where
-    H: BuildHasher + Default + Send + Sync + 'static + Clone,
-{
-    type Handle = ShardedSeizeHandle<u64, H>;
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self(Arc::new(seize::Sharded::with_capacity_and_hasher(
-            capacity,
-            H::default(),
-        )))
-    }
-
-    fn pin(&self) -> Self::Handle {
-        let map: &'static seize::Sharded<_, _, _> = unsafe { std::mem::transmute(&*self.0) };
-        ShardedSeizeHandle(map, self.0.pin())
-    }
-}
-
-impl<H> CollectionHandle for ShardedSeizeHandle<u64, H>
-where
-    H: BuildHasher + Default + Send + Sync + 'static + Clone,
-{
-    type Key = u64;
-
-    fn get(&mut self, key: &Self::Key) -> bool {
-        self.0.get(key, &self.1).is_some()
-    }
-
-    fn insert(&mut self, key: &Self::Key) -> bool {
-        self.0
-            .insert(*key, Value(AtomicU64::new(0)), &self.1)
-            .is_none()
-    }
-
-    fn remove(&mut self, key: &Self::Key) -> bool {
-        self.0.remove(key, &self.1).is_some()
-    }
-
-    fn update(&mut self, key: &Self::Key) -> bool {
-        self.0
-            .get(key, &self.1)
-            .map(|x| x.0.fetch_add(1, Relaxed))
-            .is_some()
-    }
-}
+// pub struct ShardedSeizeTable<K, H>(Arc<seize::Sharded<K, Value, H>>);
+//
+// pub struct ShardedSeizeHandle<K: 'static, H: 'static>(
+//     &'static seize::Sharded<K, Value, H>,
+//     seize::Guard,
+// );
+//
+// impl<H> Collection for ShardedSeizeTable<u64, H>
+// where
+//     H: BuildHasher + Default + Send + Sync + 'static + Clone,
+// {
+//     type Handle = ShardedSeizeHandle<u64, H>;
+//
+//     fn with_capacity(capacity: usize) -> Self {
+//         Self(Arc::new(seize::Sharded::with_capacity_and_hasher(
+//             capacity,
+//             H::default(),
+//         )))
+//     }
+//
+//     fn pin(&self) -> Self::Handle {
+//         let map: &'static seize::Sharded<_, _, _> = unsafe { std::mem::transmute(&*self.0) };
+//         ShardedSeizeHandle(map, self.0.pin())
+//     }
+// }
+//
+// impl<H> CollectionHandle for ShardedSeizeHandle<u64, H>
+// where
+//     H: BuildHasher + Default + Send + Sync + 'static + Clone,
+// {
+//     type Key = u64;
+//
+//     fn get(&mut self, key: &Self::Key) -> bool {
+//         self.0.get(key, &self.1).is_some()
+//     }
+//
+//     fn insert(&mut self, key: &Self::Key) -> bool {
+//         self.0
+//             .insert(*key, Value(AtomicU64::new(0)), &self.1)
+//             .is_none()
+//     }
+//
+//     fn remove(&mut self, key: &Self::Key) -> bool {
+//         self.0.remove(key, &self.1).is_some()
+//     }
+//
+//     fn update(&mut self, key: &Self::Key) -> bool {
+//         self.0
+//             .get(key, &self.1)
+//             .map(|x| x.0.fetch_add(1, Relaxed))
+//             .is_some()
+//     }
+// }

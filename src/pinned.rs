@@ -6,18 +6,18 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Index;
 
-use crossbeam_epoch::Guard;
+use flize::ThinShield;
 
 /// A reference to a [`HashMap`] pinned to the current thread.
 ///
 /// The only way to access a map is through a pinned reference.
 /// Dropping a pinned reference will trigger garbage collection.
-pub struct Pinned<'map, K, V, S = RandomState> {
-    pub(crate) map: &'map HashMap<K, V, S>,
-    pub(crate) guard: Guard,
+pub struct Pinned<'a, K, V, S = RandomState> {
+    pub(crate) map: &'a HashMap<K, V, S>,
+    pub(crate) guard: ThinShield<'a>,
 }
 
-impl<'map, K, V, S> Pinned<'map, K, V, S> {
+impl<K, V, S> Pinned<'_, K, V, S> {
     /// An iterator visiting all key-value pairs in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`.
     ///
@@ -118,7 +118,7 @@ impl<'map, K, V, S> Pinned<'map, K, V, S> {
     }
 }
 
-impl<'map, K, V, S> Pinned<'map, K, V, S>
+impl<K, V, S> Pinned<'_, K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
@@ -141,7 +141,7 @@ where
     /// assert_eq!(pinned.get(&1), Some(&"a"));
     /// assert_eq!(pinned.get(&2), None);
     /// ```
-    pub fn get<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
+    pub fn get<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -173,7 +173,7 @@ where
     }
 }
 
-impl<'map, K, V, S> Pinned<'map, K, V, S>
+impl<K, V, S> Pinned<'_, K, V, S>
 where
     V: Send + Sync,
     K: Hash + Eq + Send + Sync + Clone,
@@ -225,7 +225,7 @@ where
     /// assert_eq!(pinned.remove(&1), Some(&"a"));
     /// assert_eq!(pinned.remove(&1), None);
     /// ```
-    pub fn remove<'p, Q: ?Sized>(&'p self, key: &Q) -> Option<&'p V>
+    pub fn remove<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -283,9 +283,9 @@ where
     }
 }
 
-impl<'map, K, V, S> IntoIterator for &'map Pinned<'_, K, V, S> {
-    type Item = (&'map K, &'map V);
-    type IntoIter = Iter<'map, K, V>;
+impl<'a, K, V, S> IntoIterator for &'a Pinned<'a, K, V, S> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()

@@ -8,11 +8,24 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{fmt, mem, ptr};
+use std::{fmt, ptr};
 
-use crossbeam_epoch::{Atomic, Collector, Guard, Owned, Shared};
+use flize::{Collector, Shield, ThinShield};
 use lock_api::RawMutex;
 use parking_lot::Mutex;
+
+type Atomic<T> = flize::Atomic<T, flize::NullTag, flize::NullTag, 0, 0>;
+type Shared<'a, T> = flize::Shared<'a, T, flize::NullTag, flize::NullTag, 0, 0>;
+
+pub(crate) trait SharedExt<T> {
+    fn boxed(value: T) -> Self;
+}
+
+impl<'a, T> SharedExt<T> for Shared<'a, T> {
+    fn boxed(value: T) -> Self {
+        unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) }
+    }
+}
 
 pub struct HashMap<K, V, S = RandomState> {
     // The maximum number of elements per lock before we re-allocate.
@@ -51,7 +64,7 @@ struct Table<K, V> {
 impl<K, V> Table<K, V> {
     fn new(buckets_len: usize, locks_len: usize) -> Self {
         Self {
-            buckets: std::iter::repeat_with(Default::default)
+            buckets: std::iter::repeat_with(Atomic::null)
                 .take(buckets_len)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -82,8 +95,8 @@ impl<K, V> Table<K, V> {
         }
 
         /// Unlocks the specified locks on drop.
-        struct Guard<'g, K, V> {
-            table: &'g Table<K, V>,
+        struct Guard<'a, K, V> {
+            table: &'a Table<K, V>,
             range: Range<usize>,
         }
 
@@ -199,7 +212,7 @@ impl<K, V, S> HashMap<K, V, S> {
         Self {
             resize: Arc::new(Mutex::new(())),
             budget: AtomicUsize::new(resize::budget(capacity, lock_count)),
-            table: Atomic::new(Table::new(capacity, lock_count)),
+            table: Atomic::new(Shared::boxed(Table::new(capacity, lock_count))),
             collector,
             hash_builder,
         }
@@ -230,11 +243,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        Self::with_capacity_hasher_and_collector(
-            capacity,
-            hash_builder,
-            crossbeam_epoch::default_collector().clone(),
-        )
+        Self::with_capacity_hasher_and_collector(capacity, hash_builder, Collector::new())
     }
 }
 
@@ -246,12 +255,12 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn pin(&self) -> Pinned<'_, K, V, S> {
         Pinned {
             map: self,
-            guard: self.collector.register().pin(),
+            guard: self.collector.thin_shield(),
         }
     }
 
     /// Returns the number of elements in the map.
-    pub(crate) fn len(&self, guard: &Guard) -> usize {
+    pub(crate) fn len(&self, guard: &ThinShield<'_>) -> usize {
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
 
         match table {
@@ -261,12 +270,12 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     /// Returns `true` if the map contains no elements.
-    pub(crate) fn is_empty(&self, guard: &Guard) -> bool {
+    pub(crate) fn is_empty(&self, guard: &ThinShield<'_>) -> bool {
         self.len(guard) == 0
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
-    pub(crate) fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
+    pub(crate) fn iter<'a>(&'a self, guard: &'a ThinShield<'a>) -> Iter<'a, K, V> {
         let table = self.table.load(Ordering::Acquire, guard);
         let first_node = unsafe { table.as_ref().and_then(|t| t.buckets.get(0)) };
 
@@ -280,31 +289,35 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     /// An iterator visiting all keys in arbitrary order.
-    pub(crate) fn keys<'g>(&self, guard: &'g Guard) -> Keys<'g, K, V> {
+    pub(crate) fn keys<'a>(&'a self, guard: &'a ThinShield<'a>) -> Keys<'a, K, V> {
         Keys {
             iter: self.iter(guard),
         }
     }
 
     /// An iterator visiting all values in arbitrary order.
-    pub(crate) fn values<'g>(&self, guard: &'g Guard) -> Values<'g, K, V> {
+    pub(crate) fn values<'a>(&'a self, guard: &'a ThinShield<'a>) -> Values<'a, K, V> {
         Values {
             iter: self.iter(guard),
         }
     }
 
-    fn init_table<'g>(&'g self, capacity: Option<usize>, guard: &'g Guard) -> &'g Table<K, V> {
+    fn init_table<'a>(
+        &'a self,
+        capacity: Option<usize>,
+        guard: &'a ThinShield<'a>,
+    ) -> &'a Table<K, V> {
         let _guard = self.resize.lock();
 
         let capacity = capacity.unwrap_or(resize::DEFAULT_BUCKETS);
         match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
             Some(table) => table,
             None => {
-                let new_table = Owned::new(Table::new(capacity, resize::initial_locks(capacity)))
-                    .into_shared(guard);
+                let new_table =
+                    Shared::boxed(Table::new(capacity, resize::initial_locks(capacity)));
 
                 self.table.store(new_table, Ordering::Release);
-                unsafe { new_table.deref() }
+                unsafe { new_table.as_ref_unchecked() }
             }
         }
     }
@@ -316,7 +329,7 @@ where
     S: BuildHasher,
 {
     /// Returns a reference to the value corresponding to the key.
-    pub(crate) fn get<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub(crate) fn get<'a, Q: ?Sized>(&'a self, key: &Q, guard: &'a ThinShield<'a>) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -324,12 +337,12 @@ where
         self.get_hashed(key, guard, self.hash(key))
     }
 
-    pub(crate) fn get_hashed<'g, Q: ?Sized>(
-        &'g self,
+    pub(crate) fn get_hashed<'a, Q: ?Sized>(
+        &'a self,
         key: &Q,
-        guard: &'g Guard,
+        guard: &'a ThinShield<'a>,
         hash: u64,
-    ) -> Option<&'g V>
+    ) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -337,27 +350,21 @@ where
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
         let bucket_index = bucket_index(hash, table.buckets.len() as _);
-        let mut node_ptr = table.buckets.get(bucket_index as usize);
 
-        while let Some(node) = node_ptr {
-            // Look Ma, no lock!
-            let node = match unsafe { node.load(Ordering::Acquire, guard).as_ref() } {
-                Some(node) => node,
-                None => break,
-            };
-
+        let mut walk = &table.buckets[bucket_index as usize];
+        while let Some(node) = unsafe { walk.load(Ordering::Acquire, guard).as_ref() } {
             if node.hash == hash && node.key.borrow() == key {
                 return Some(unsafe { node.value.as_ref() });
             }
 
-            node_ptr = Some(&node.next);
+            walk = &node.next;
         }
 
         None
     }
 
     /// Returns `true` if the map contains a value for the specified key.
-    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &Guard) -> bool
+    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &ThinShield<'_>) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -391,18 +398,23 @@ where
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though; this matters for
     /// types that can be `==` without being identical.
-    pub(crate) fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
+    pub(crate) fn insert<'a>(
+        &'a self,
+        key: K,
+        value: V,
+        guard: &'a ThinShield<'a>,
+    ) -> Option<&'a V> {
         let h = self.hash(&key);
         self.insert_hashed(key, value, guard, h)
     }
 
-    pub(crate) fn insert_hashed<'g>(
-        &'g self,
+    pub(crate) fn insert_hashed<'a>(
+        &'a self,
         key: K,
         value: V,
-        guard: &'g Guard,
+        guard: &'a ThinShield<'a>,
         hash: u64,
-    ) -> Option<&'g V> {
+    ) -> Option<&'a V> {
         let mut should_resize = false;
 
         loop {
@@ -418,60 +430,55 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
+                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
                     continue;
                 }
 
                 // Try to find this key in the bucket
-                let mut curr = table.buckets.get(bucket_index as usize);
-                while let Some(node_ptr) = curr {
-                    let node = match unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() } {
-                        Some(node) => node,
-                        None => break,
-                    };
+                let mut node_ptr = &table.buckets[bucket_index as usize];
+                let node = node_ptr.load(Ordering::Acquire, guard);
+
+                while !node.is_null() {
+                    let node_ref = unsafe { node.as_ref_unchecked() };
 
                     // If the key already exists, update the value.
-                    if hash == node.hash && node.key == key {
+                    if hash == node_ref.hash && node_ref.key == key {
                         // Here we create a new node instead of updating the value atomically.
                         //
                         // This is a tradeoff, we don't have to do atomic loads on reads,
                         // but we have to do an extra allocation here for the node.
                         let new_node = Node {
                             key,
-                            next: node.next.clone(),
+                            next: Atomic::new(node_ref.next.load(Ordering::Relaxed, guard)),
                             value: NonNull::from(Box::leak(Box::new(value))),
                             hash,
                         };
 
-                        node_ptr.store(Owned::new(new_node), Ordering::Release);
+                        node_ptr.store(Shared::boxed(new_node), Ordering::Release);
 
-                        let old_val = unsafe { node.value.as_ref() };
+                        let old_val = unsafe { node_ref.value.as_ref() };
 
-                        unsafe {
-                            guard.defer_destroy(Shared::from(node as *const _));
-
-                            let ptr = node.value.as_ptr();
-                            guard.defer_unchecked(move || {
-                                let _ = Box::from_raw(ptr);
-                            });
-                        };
+                        guard.retire(move || unsafe {
+                            let _: Box<V> = Box::from_raw(node_ref.value.as_ptr());
+                            let _: Box<Node<K, V>> = Box::from_raw(node.as_ptr());
+                        });
 
                         return Some(old_val);
                     }
 
-                    curr = Some(&node.next);
+                    node_ptr = &node_ref.next;
                 }
 
                 let node = &table.buckets[bucket_index as usize];
 
                 let new = Node {
                     key,
-                    next: node.clone(),
+                    next: Atomic::new(node.load(Ordering::Relaxed, guard)),
                     value: NonNull::from(Box::leak(Box::new(value))),
                     hash,
                 };
 
-                node.store(Owned::new(new), Ordering::Release);
+                node.store(Shared::boxed(new), Ordering::Release);
 
                 let count =
                     unsafe { table.counts[lock_index as usize].fetch_add(1, Ordering::AcqRel) + 1 };
@@ -499,7 +506,11 @@ where
 
     /// Removes a key from the map, returning the value at the key if the key
     /// was previously in the map.
-    pub(crate) fn remove<'g, Q: ?Sized>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub(crate) fn remove<'a, Q: ?Sized>(
+        &'a self,
+        key: &Q,
+        guard: &'a ThinShield<'a>,
+    ) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -507,12 +518,12 @@ where
         self.remove_hashed(key, guard, self.hash(key))
     }
 
-    pub(crate) fn remove_hashed<'g, Q: ?Sized>(
-        &'g self,
+    pub(crate) fn remove_hashed<'a, Q: ?Sized>(
+        &'a self,
         key: &Q,
-        guard: &'g Guard,
+        guard: &'a ThinShield<'a>,
         hash: u64,
-    ) -> Option<&'g V>
+    ) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -527,13 +538,12 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
+                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
                     continue;
                 }
 
-                let mut curr = table.buckets.get(bucket_index as usize);
-
-                while let Some(node_ptr) = curr {
+                let mut walk = table.buckets.get(bucket_index as usize);
+                while let Some(node_ptr) = walk {
                     let node = match unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() } {
                         Some(node) => node,
                         None => break,
@@ -547,19 +557,15 @@ where
 
                         let val = unsafe { node.value.as_ref() };
 
-                        unsafe {
-                            guard.defer_destroy(Shared::from(node as *const _));
-
-                            let ptr = node.value.as_ptr();
-                            guard.defer_unchecked(move || {
-                                let _ = Box::from_raw(ptr);
-                            });
-                        }
+                        guard.retire(move || unsafe {
+                            let _: Box<V> = Box::from_raw(node.value.as_ptr());
+                            let _: Box<Node<K, V>> = Box::from_raw(node as *const _ as *mut _);
+                        });
 
                         return Some(val);
                     }
 
-                    curr = Some(&node.next);
+                    walk = Some(&node.next);
                 }
             }
 
@@ -568,7 +574,7 @@ where
     }
 
     /// Clears the map, removing all key-value pairs.
-    pub(crate) fn clear(&self, guard: &Guard) {
+    pub(crate) fn clear(&self, guard: &ThinShield<'_>) {
         // TODO: acquire each lock and destroy the buckets guarded by it
         // sequentially instead of all at once
         let (table, _guard) = match self.lock_all(guard) {
@@ -577,37 +583,28 @@ where
             None => return,
         };
 
+        // walk through the table buckets, and set each initial node to null, destroying the rest
+        // of the nodes and values.
         for bucket_ptr in table.buckets.iter() {
             match unsafe { bucket_ptr.load(Ordering::Acquire, guard).as_ref() } {
                 Some(bucket) => {
-                    // set the bucket to null
                     bucket_ptr.store(Shared::null(), Ordering::Release);
 
-                    // drop the value
-                    unsafe {
-                        let ptr = bucket.value.as_ptr();
-                        guard.defer_unchecked(move || {
-                            let _ = Box::from_raw(ptr);
+                    guard.retire(move || unsafe {
+                        let _: Box<V> = Box::from_raw(bucket.value.as_ptr());
+                    });
+
+                    let mut walk = &bucket.next;
+                    while let Some(node) = unsafe { walk.load(Ordering::Relaxed, guard).as_ref() } {
+                        guard.retire(move || unsafe {
+                            let _: Box<V> = Box::from_raw(node.value.as_ptr());
+                            let _: Box<Node<K, V>> = Box::from_raw(node as *const _ as *mut _);
                         });
-                    }
 
-                    // drop the rest of  nodes and values
-                    let mut next = &bucket.next;
-                    while let Some(node) = unsafe { next.load(Ordering::Acquire, guard).as_ref() } {
-                        unsafe {
-                            guard.defer_destroy(Shared::from(node as *const _));
-
-                            let ptr = node.value.as_ptr();
-                            guard.defer_unchecked(move || {
-                                let _ = Box::from_raw(ptr);
-                            });
-                        }
-
-                        next = &node.next;
+                        walk = &node.next;
                     }
                 }
-                // the bucket is already null
-                None => return,
+                None => break,
             }
         }
 
@@ -624,11 +621,11 @@ where
     }
 
     /// Reserves capacity for at least additional more elements to be inserted in the `HashMap`.
-    pub(crate) fn reserve<'g>(&'g self, additional: usize, guard: &'g Guard) {
+    pub(crate) fn reserve<'a>(&'a self, additional: usize, guard: &'a ThinShield<'a>) {
         match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
             Some(table) => {
                 let capacity = table.len() + additional;
-                unsafe { self.resize(table, Some(capacity), guard) };
+                self.resize(table, Some(capacity), guard);
             }
             None => {
                 self.init_table(Some(additional), guard);
@@ -648,11 +645,16 @@ where
     ///
     /// If a `new_len` is given, that length will be used instead of the default
     /// resizing behavior.
-    fn resize<'g>(&'g self, table: &'g Table<K, V>, new_len: Option<usize>, guard: &'g Guard) {
+    fn resize<'a>(
+        &'a self,
+        table: &'a Table<K, V>,
+        new_len: Option<usize>,
+        guard: &'a ThinShield<'a>,
+    ) {
         let _guard = self.resize.lock();
 
         // Make sure nobody resized the table while we were waiting for the resize lock.
-        if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_raw()) {
+        if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
             // We assume that since the table reference is different, it was
             // already resized (or the budget was adjusted). If we ever decide
             // to do table shrinking, or replace the table for other reasons,
@@ -703,7 +705,7 @@ where
             .take(new_locks_len.unwrap_or(current_locks))
             .collect::<Vec<AtomicUsize>>();
 
-        let mut new_buckets = std::iter::repeat_with(Default::default)
+        let mut new_buckets = std::iter::repeat_with(Atomic::null)
             .take(new_len)
             .collect::<Vec<Atomic<_>>>();
 
@@ -712,36 +714,46 @@ where
 
         // Copy all data into a new buckets, creating new nodes for all elements.
         for i in 0..table.buckets.len() {
-            let mut current = &table.buckets[i];
-
-            while let Some(node) = unsafe { current.load(Ordering::Acquire, guard).as_ref() } {
+            let mut walk = table.buckets[i].load(Ordering::Relaxed, guard);
+            while let Some(node) = unsafe { walk.as_ref() } {
                 let new_bucket_index = bucket_index(node.hash, new_len as _);
                 let new_lock_index = lock_index(
                     new_bucket_index,
                     new_locks_len.unwrap_or(current_locks) as _,
                 );
 
-                new_buckets[new_bucket_index as usize] = Atomic::new(Node {
-                    key: node.key.clone(),
-                    value: node.value.clone(),
-                    next: new_buckets[new_bucket_index as usize].clone(),
-                    hash: node.hash,
-                });
+                let next = node.next.load(Ordering::Relaxed, guard);
+                let head = new_buckets[new_bucket_index as usize].load(Ordering::Relaxed, guard);
+
+                // if `next` is the same as the new head, we can skip an allocation and just copy
+                // the pointer
+                if next == head {
+                    new_buckets[new_bucket_index as usize] = Atomic::new(walk);
+                } else {
+                    new_buckets[new_bucket_index as usize] = Atomic::new(Shared::boxed(Node {
+                        key: node.key.clone(),
+                        value: node.value.clone(),
+                        next: Atomic::new(
+                            new_buckets[new_bucket_index as usize].load(Ordering::Relaxed, guard),
+                        ),
+                        hash: node.hash,
+                    }));
+
+                    guard.retire(move || unsafe {
+                        let _: Box<Node<K, V>> = Box::from_raw(walk.as_ptr());
+                    });
+                }
 
                 new_counts[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
 
-                unsafe {
-                    guard.defer_destroy(Shared::from(node as *const _));
-                }
-
-                current = &node.next;
+                walk = next;
             }
         }
 
         self.budget.store(new_budget, Ordering::SeqCst);
 
         self.table.store(
-            Owned::new(Table {
+            Shared::boxed(Table {
                 buckets: new_buckets.into_boxed_slice(),
                 locks: new_locks
                     .map(Arc::from)
@@ -751,13 +763,16 @@ where
             Ordering::Release,
         );
 
-        unsafe {
-            guard.defer_destroy(Shared::from(table as *const _));
-        }
+        guard.retire(move || unsafe {
+            let _: Box<Table<K, V>> = Box::from_raw(table as *const _ as *mut _);
+        });
     }
 
     /// Acquires all locks for this table.
-    fn lock_all<'g>(&'g self, guard: &'g Guard) -> Option<(&'g Table<K, V>, impl Drop + 'g)> {
+    fn lock_all<'a>(
+        &'a self,
+        guard: &'a ThinShield<'a>,
+    ) -> Option<(&'a Table<K, V>, impl Drop + 'a)> {
         // Acquire the resize lock.
         let _guard = self.resize.lock();
 
@@ -794,26 +809,25 @@ fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
 
 impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
-        let guard = unsafe { crossbeam_epoch::unprotected() };
+        let guard = unsafe { flize::unprotected() };
 
-        let table = self.table.load(Ordering::Relaxed, &guard);
+        let table = self.table.load(Ordering::Relaxed, guard);
 
         // table was never allocated
         if table.is_null() {
             return;
         }
 
-        let mut table = unsafe { table.into_owned() };
+        let mut table = unsafe { Box::from_raw(table.as_ptr()) };
 
         // drop all nodes and values
-        for bucket in table.buckets.iter_mut().map(mem::take) {
-            let mut node = bucket;
+        for bucket in table.buckets.iter_mut() {
+            let mut walk = bucket.load(Ordering::Relaxed, guard);
+            while let Some(node) = unsafe { walk.as_ref() } {
+                let node: Box<Node<K, V>> = unsafe { Box::from_raw(node as *const _ as *mut _) };
+                let _: Box<V> = unsafe { Box::from_raw(node.value.as_ptr()) };
 
-            while !unsafe { node.load(Ordering::Acquire, guard).is_null() } {
-                let mut d = unsafe { node.into_owned() };
-                let _ = unsafe { Box::from_raw(d.value.as_ptr()) };
-
-                node = mem::take(&mut d.next);
+                walk = node.next.load(Ordering::Relaxed, guard);
             }
         }
     }
@@ -845,10 +859,12 @@ where
         let self_pinned = self.pin();
 
         let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.hash_builder.clone());
-        let clone_pinned = clone.pin();
+        {
+            let clone_pinned = clone.pin();
 
-        for (k, v) in self_pinned.iter() {
-            clone_pinned.insert(k.clone(), v.clone());
+            for (k, v) in self_pinned.iter() {
+                clone_pinned.insert(k.clone(), v.clone());
+            }
         }
 
         clone
@@ -861,7 +877,7 @@ where
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.collector.register().pin();
+        let guard = self.collector.thin_shield();
         f.debug_map().entries(self.iter(&guard)).finish()
     }
 }
@@ -881,7 +897,12 @@ where
     V: PartialEq,
     S: BuildHasher,
 {
-    pub(crate) fn eq(&self, guard: &Guard, other: &Self, other_guard: &Guard) -> bool {
+    pub(crate) fn eq(
+        &self,
+        guard: &ThinShield<'_>,
+        other: &Self,
+        other_guard: &ThinShield<'_>,
+    ) -> bool {
         if self.len(guard) != other.len(other_guard) {
             return false;
         }
@@ -898,8 +919,8 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        let guard = self.collector.register().pin();
-        let other_guard = other.collector.register().pin();
+        let guard = self.collector.thin_shield();
+        let other_guard = other.collector.thin_shield();
 
         Self::eq(self, &guard, other, &other_guard)
     }
@@ -929,16 +950,16 @@ where
 /// map.insert("a", 1);
 /// let iter = map.iter();
 /// ```
-pub struct Iter<'g, K, V> {
-    table: Shared<'g, Table<K, V>>,
-    guard: &'g Guard,
-    current_node: Option<&'g Atomic<Node<K, V>>>,
+pub struct Iter<'a, K, V> {
+    table: Shared<'a, Table<K, V>>,
+    guard: &'a ThinShield<'a>,
+    current_node: Option<&'a Atomic<Node<K, V>>>,
     current_bucket: usize,
     size: usize,
 }
 
-impl<'g, K, V> Iterator for Iter<'g, K, V> {
-    type Item = (&'g K, &'g V);
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1009,12 +1030,12 @@ impl<K, V> Clone for Iter<'_, K, V> {
 /// map.insert("a", 1);
 /// let iter_keys = map.keys();
 /// ```
-pub struct Keys<'g, K, V> {
-    iter: Iter<'g, K, V>,
+pub struct Keys<'a, K, V> {
+    iter: Iter<'a, K, V>,
 }
 
-impl<'g, K, V> Iterator for Keys<'g, K, V> {
-    type Item = &'g K;
+impl<'a, K, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(k, _)| k)
@@ -1059,12 +1080,12 @@ impl<K, V> Clone for Keys<'_, K, V> {
 /// map.insert("a", 1);
 /// let iter_values = map.values();
 /// ```
-pub struct Values<'g, K, V> {
-    iter: Iter<'g, K, V>,
+pub struct Values<'a, K, V> {
+    iter: Iter<'a, K, V>,
 }
 
-impl<'g, K, V> Iterator for Values<'g, K, V> {
-    type Item = &'g V;
+impl<'a, K, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(_, v)| v)
@@ -1099,33 +1120,37 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let map = HashMap::new();
-        let pinned = map.pin();
-        pinned.insert(1, "a");
-        pinned.insert(2, "b");
-        assert_eq!(pinned.get(&1), Some(&"a"));
-        assert_eq!(pinned.get(&2), Some(&"b"));
-        assert_eq!(pinned.get(&3), None);
+        let map: HashMap<usize, &'static str> = HashMap::new();
 
-        assert_eq!(pinned.remove(&2), Some(&"b"));
-        assert_eq!(pinned.remove(&2), None);
+        {
+            let pinned = map.pin();
+            pinned.insert(1, "a");
+            pinned.insert(2, "b");
+            assert_eq!(pinned.get(&1), Some(&"a"));
+            assert_eq!(pinned.get(&2), Some(&"b"));
+            assert_eq!(pinned.get(&3), None);
 
-        for i in 0..100 {
-            pinned.insert(i, "a");
+            assert_eq!(pinned.remove(&2), Some(&"b"));
+            assert_eq!(pinned.remove(&2), None);
+
+            for i in 0..10000 {
+                pinned.insert(i, "a");
+            }
+
+            for i in 0..10000 {
+                assert_eq!(pinned.get(&i), Some(&"a"));
+            }
+
+            assert!([
+                pinned.iter().count(),
+                pinned.len(),
+                pinned.iter().size_hint().0,
+                pinned.iter().size_hint().1.unwrap()
+            ]
+            .iter()
+            .all(|&l| l == 10000));
         }
 
-        for i in 0..100 {
-            assert_eq!(pinned.get(&i), Some(&"a"));
-        }
-
-        assert!([
-            pinned.iter().count(),
-            pinned.len(),
-            pinned.iter().size_hint().0,
-            pinned.iter().size_hint().1.unwrap()
-        ]
-        .iter()
-        .all(|&l| l == 100));
         drop(map);
     }
 }

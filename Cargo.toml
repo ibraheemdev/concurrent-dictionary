@@ -15,7 +15,7 @@ categories = ["concurrency", "data-structures"]
 exclude = ["/dotnet/**"]
 
 [dependencies]
-crossbeam-epoch = "0.9.5"
 num_cpus = "1.13.0"
 lock_api = "0.4.5"
 parking_lot = "0.11.2"
+flize = { git = "https://github.com/xacrimon/flize" }
