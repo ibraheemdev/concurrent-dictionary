@@ -1,0 +1,3 @@
+== ReadHeavy
+-- FxSeize
+writing flamegraph to "flamegraph.svg"
