@@ -84,7 +84,8 @@ impl<K, V> Inner<K, V> {
 
     pub fn bucket<'a>(
         &'a self,
-        hash: u64,
+        idx: usize,
+        ordering: Ordering,
         guard: &'a Guard<'a>,
     ) -> impl Iterator<
         Item = (
@@ -93,11 +94,9 @@ impl<K, V> Inner<K, V> {
             &'a Node<K, V>,
         ),
     > {
-        let bucket = bucket_index(hash, self.buckets.len() as _) as usize;
-
-        let mut atomic = &self.buckets[bucket];
+        let mut atomic = &self.buckets[idx];
         std::iter::from_fn(move || {
-            let ptr = atomic.load(Ordering::Acquire, guard);
+            let ptr = atomic.load(ordering, guard);
             if ptr.is_null() {
                 return None;
             }
@@ -210,7 +209,9 @@ where
         let hash = self.hash(key);
         let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
 
-        for (_, _, node) in table.bucket(hash, guard) {
+        let bucket = bucket_index(hash, table.buckets.len());
+
+        for (_, _, node) in table.bucket(bucket, Ordering::Acquire, guard) {
             if node.hash == hash && node.key.borrow() == key {
                 return Some(unsafe { node.value.as_ref() });
             }
@@ -254,67 +255,69 @@ where
 
         loop {
             let mut table_ptr = unsafe { self.table.load(Ordering::Acquire, guard) };
+
             if table_ptr.is_null() {
                 table_ptr = self.init_table(resize::DEFAULT_BUCKETS, guard);
             }
 
             let table = unsafe { table_ptr.deref() };
+
             let bucket = bucket_index(hash, table.buckets.len() as _);
             let lock = lock_index(bucket, table.locks.len() as _) as usize;
 
-            {
-                let _guard = table.locks[lock].lock();
+            let _bucket = table.locks[lock].lock();
 
-                // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(
-                    table_ptr.as_ptr(),
-                    self.table.load(Ordering::Acquire, guard).as_ptr(),
-                ) {
-                    continue;
-                }
+            // If the table just got resized, we may not be holding the right lock.
+            if !ptr::eq(
+                table_ptr.as_ptr(),
+                self.table.load(Ordering::Acquire, guard).as_ptr(),
+            ) {
+                continue;
+            }
 
-                // Try to find this key in the bucket
-                for (atomic, ptr, node) in table.bucket(hash, guard) {
-                    if node.hash == hash && node.key == key {
-                        // If the key already exists, update the value.
-                        let new = Node {
-                            key,
-                            next: node.next.copy(Ordering::Relaxed),
-                            value: NonNull::from(Box::leak(Box::new(value))),
-                            hash,
-                        };
-                        atomic.store(Owned::new(new).into_shared(guard), Ordering::Release);
+            // Try to find this key in the bucket
+            for (atomic, ptr, node) in table.bucket(bucket, Ordering::Acquire, guard) {
+                if node.hash == hash && node.key == key {
+                    // If the key already exists, update the value.
+                    let new = Node {
+                        key,
+                        next: node.next.copy(Ordering::Relaxed),
+                        value: NonNull::from(Box::leak(Box::new(value))),
+                        hash,
+                    };
+                    atomic.store(Owned::new(new).into_shared(guard), Ordering::Release);
 
-                        guard.retire(move || unsafe {
-                            let node = ptr.into_owned();
-                            let _ = Box::from_raw(node.value.as_ptr());
-                        });
+                    guard.retire(move || unsafe {
+                        let node = ptr.into_owned();
+                        let _ = Box::from_raw(node.value.as_ptr());
+                    });
 
-                        return Some(unsafe { node.value.as_ref() });
-                    }
-                }
-
-                // Otherwise insert a new one.
-                let node = &table.buckets[bucket as usize];
-                let new = Node {
-                    key,
-                    next: node.copy(Ordering::Relaxed),
-                    value: NonNull::from(Box::leak(Box::new(value))),
-                    hash,
-                };
-
-                node.store(Owned::new(new).into_shared(guard), Ordering::Release);
-
-                // If the number of elements guarded by this lock has exceeded the budget, resize
-                // the hash table.
-                //
-                // It is also possible that `resize` will increase the budget instead of resizing the
-                // hashtable if keys are poorly distributed across buckets.
-                let count = unsafe { table.counts[lock].fetch_add(1, Ordering::AcqRel) + 1 };
-                if count > self.budget.load(Ordering::SeqCst) {
-                    should_resize = true;
+                    return Some(unsafe { node.value.as_ref() });
                 }
             }
+
+            // Otherwise insert a new one.
+            let node = &table.buckets[bucket as usize];
+            let new = Node {
+                key,
+                next: node.copy(Ordering::Relaxed),
+                value: NonNull::from(Box::leak(Box::new(value))),
+                hash,
+            };
+
+            node.store(Owned::new(new).into_shared(guard), Ordering::Release);
+
+            // If the number of elements guarded by this lock has exceeded the budget, resize
+            // the hash table.
+            //
+            // It is also possible that `resize` will increase the budget instead of resizing the
+            // hashtable if keys are poorly distributed across buckets.
+            let count = table.counts[lock].fetch_add(1, Ordering::AcqRel) + 1;
+            if count > self.budget.load(Ordering::SeqCst) {
+                should_resize = true;
+            }
+
+            drop(_bucket);
 
             // Resize the table if we're passed our budget.
             //
@@ -337,50 +340,37 @@ where
         let hash = self.hash(key);
 
         loop {
-            let table = unsafe { self.table.load(Ordering::Acquire, guard) };
-            let table_ref = unsafe { table.as_ref() }?;
+            let table_ptr = unsafe { self.table.load(Ordering::Acquire, guard) };
+            let table = unsafe { table_ptr.as_ref() }?;
 
-            let bucket_index = bucket_index(hash, table_ref.buckets.len() as _);
-            let lock_index = lock_index(bucket_index, table_ref.locks.len() as _);
+            let bucket = bucket_index(hash, table.buckets.len() as _);
+            let lock_index = lock_index(bucket, table.locks.len() as _);
 
-            {
-                let _guard = table_ref.locks[lock_index as usize].lock();
+            let _bucket = table.locks[lock_index as usize].lock();
 
-                // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(
-                    table.as_ptr(),
-                    self.table.load(Ordering::Acquire, guard).as_ptr(),
-                ) {
-                    continue;
-                }
+            // If the table just got resized, we may not be holding the right lock.
+            if !ptr::eq(
+                table_ptr.as_ptr(),
+                self.table.load(Ordering::Acquire, guard).as_ptr(),
+            ) {
+                continue;
+            }
 
-                let mut walk = table_ref.buckets.get(bucket_index as usize);
-                while let Some(node_ptr) = walk {
-                    let node = unsafe { node_ptr.load(Ordering::Acquire, guard) };
-                    let node_ref = match unsafe { node.as_ref() } {
-                        Some(x) => x,
-                        None => break,
-                    };
+            for (atomic, ptr, node) in table.bucket(bucket, Ordering::Acquire, guard) {
+                if node.hash == hash && node.key.borrow() == key {
+                    let next = node.next.load(Ordering::Acquire, guard);
+                    atomic.store(next, Ordering::Release);
 
-                    if hash == node_ref.hash && node_ref.key.borrow() == key {
-                        let next = node_ref.next.load(Ordering::Acquire, guard);
-                        node_ptr.store(next, Ordering::Release);
+                    unsafe { table.counts[lock_index as usize].fetch_min(1, Ordering::AcqRel) };
 
-                        unsafe {
-                            table_ref.counts[lock_index as usize].fetch_min(1, Ordering::AcqRel)
-                        };
+                    let val = unsafe { node.value.as_ref() };
 
-                        let val = unsafe { node_ref.value.as_ref() };
+                    guard.retire(move || unsafe {
+                        let node = ptr.into_owned();
+                        let _ = Box::from_raw(node.value.as_ptr());
+                    });
 
-                        guard.retire(move || unsafe {
-                            let node = node.into_owned();
-                            let _ = Box::from_raw(node.value.as_ptr());
-                        });
-
-                        return Some(val);
-                    }
-
-                    walk = Some(&node_ref.next);
+                    return Some(val);
                 }
             }
 
@@ -394,45 +384,44 @@ where
 
         // Now that we have the resize lock, we can safely load the table and acquire it's
         // locks, knowing that it cannot change.
-        let table = self.table.load(Ordering::Acquire, guard);
-        let table_ref = match unsafe { table.as_ref() } {
+        let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
             Some(table) => table,
             None => return,
         };
 
-        let _buckets = table_ref.lock_buckets();
+        let _buckets = table.lock_buckets();
 
-        // walk through the table buckets, and set each initial node to null, destroying the rest
-        // of the nodes and values.
-        for bucket_ptr in table_ref.buckets.iter() {
-            match unsafe { bucket_ptr.load(Ordering::Acquire, guard).as_ref() } {
-                Some(bucket) => {
-                    bucket_ptr.store(Shared::null(), Ordering::Release);
+        // clear buckets
+        for ptr in table.buckets.iter() {
+            let bucket = match unsafe { ptr.load(Ordering::Acquire, guard).as_ref() } {
+                Some(bucket) => bucket,
+                None => continue,
+            };
 
-                    guard.retire(move || unsafe {
-                        let _ = Box::from_raw(bucket.value.as_ptr());
-                    });
+            // set the initial node to null
+            ptr.store(Shared::null(), Ordering::Release);
+            guard.retire(move || unsafe {
+                let _ = Box::from_raw(bucket.value.as_ptr());
+            });
 
-                    let mut node = bucket.next.load(Ordering::Relaxed, guard);
-                    while !node.is_null() {
-                        guard.retire(move || unsafe {
-                            let node = node.into_owned();
-                            let _ = Box::from_raw(node.value.as_ptr());
-                        });
+            // destroy the rest
+            let mut node = bucket.next.load(Ordering::Acquire, guard);
+            while !node.is_null() {
+                guard.retire(move || unsafe {
+                    let node = node.into_owned();
+                    let _ = Box::from_raw(node.value.as_ptr());
+                });
 
-                        node = unsafe { node.deref().next.load(Ordering::Relaxed, guard) };
-                    }
-                }
-                None => break,
+                node = unsafe { node.deref().next.load(Ordering::Acquire, guard) };
             }
         }
 
         // reset the counts
-        for i in 0..table_ref.counts.len() {
-            table_ref.counts[i].store(0, Ordering::Release);
+        for count in table.counts.iter() {
+            count.store(0, Ordering::Release);
         }
 
-        if let Some(budget) = resize::clear_budget(table_ref.buckets.len(), table_ref.locks.len()) {
+        if let Some(budget) = resize::clear_budget(table.buckets.len(), table.locks.len()) {
             // store the new budget, which might be different if the map was
             // badly distributed
             self.budget.store(budget, Ordering::SeqCst);
@@ -466,7 +455,7 @@ where
     // resizing behavior.
     unsafe fn resize<'a>(
         &'a self,
-        table: Shared<'a, Inner<K, V>>,
+        table_ptr: Shared<'a, Inner<K, V>>,
         new_len: Option<usize>,
         guard: &'a Guard<'a>,
     ) {
@@ -474,7 +463,7 @@ where
 
         // Make sure nobody resized the table while we were waiting for the resize lock.
         if !ptr::eq(
-            table.as_ptr(),
+            table_ptr.as_ptr(),
             self.table.load(Ordering::Acquire, guard).as_ptr(),
         ) {
             // We assume that since the table reference is different, it was
@@ -484,15 +473,15 @@ where
             return;
         }
 
-        let table_ref = unsafe { table.deref() };
-        let current_locks = table_ref.locks.len();
+        let table = unsafe { table_ptr.deref() };
+        let current_locks = table.locks.len();
         let (new_len, new_locks, new_budget) = match new_len {
             Some(len) => {
                 let locks = resize::new_locks(len, current_locks);
                 let budget = resize::budget(len, locks.unwrap_or(current_locks));
                 (len, locks, budget)
             }
-            None => match resize::resize(table_ref.buckets.len(), current_locks, table_ref.len()) {
+            None => match resize::resize(table.buckets.len(), current_locks, table.len()) {
                 resize::Resize::Resize {
                     buckets,
                     locks,
@@ -509,14 +498,14 @@ where
         // Add more locks to account for the new buckets.
         let new_locks = new_locks
             .map(|len| {
-                table_ref
+                table
                     .locks
                     .iter()
                     .cloned()
                     .chain((current_locks..len).map(|_| Arc::default()))
                     .collect()
             })
-            .unwrap_or_else(|| table_ref.locks.clone());
+            .unwrap_or_else(|| table.locks.clone());
 
         let new_counts = std::iter::repeat_with(AtomicUsize::default)
             .take(new_locks.len())
@@ -527,13 +516,11 @@ where
             .collect::<Vec<_>>();
 
         // Now lock the rest of the buckets to make sure nothing is modified while resizing.
-        let _buckets = table_ref.lock_buckets();
+        let _buckets = table.lock_buckets();
 
         // Copy all data into a new buckets, creating new nodes for all elements.
-        for bucket in table_ref.buckets.iter() {
-            let mut node = bucket.load(Ordering::Relaxed, guard);
-            while !node.is_null() {
-                let node_ref = unsafe { node.deref() };
+        for i in 0..table.buckets.len() {
+            for (_, ptr, node) in table.bucket(i, Ordering::Acquire, guard) {
                 let new_bucket_index = bucket_index(node_ref.hash, new_len as _);
                 let new_lock_index = lock_index(new_bucket_index, new_locks.len() as _);
 
@@ -558,8 +545,6 @@ where
                 }
 
                 new_counts[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
-
-                node = next;
             }
         }
 
@@ -576,25 +561,26 @@ where
         );
 
         guard.retire(move || unsafe {
-            let _ = table.into_owned();
+            let _ = table_ptr.into_owned();
         });
     }
 }
 
 // Computes the bucket index for a particular key.
-fn bucket_index(hashcode: u64, bucket_count: u64) -> u64 {
+fn bucket_index(hashcode: u64, bucket_count: usize) -> usize {
+    let bucket_count = bucket_count as u64;
     let bucket_index = (hashcode & 0x7fffffff) % bucket_count;
     debug_assert!(bucket_index < bucket_count);
 
-    bucket_index
+    bucket_index as _
 }
 
 // Computes the lock index for a particular bucket.
-fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
+fn lock_index(bucket_index: usize, lock_count: usize) -> usize {
     let lock_index = bucket_index % lock_count;
     debug_assert!(lock_index < lock_count);
 
-    lock_index
+    lock_index as _
 }
 
 impl<K, V, S> Drop for RawTable<K, V, S> {
@@ -777,5 +763,49 @@ impl<K, V> Clone for Iter<'_, K, V> {
             current_bucket: self.current_bucket,
             size: self.size,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        let pinned: RawTable<usize, &'static str> =
+            RawTable::with_hasher(std::collections::hash_map::RandomState::new());
+
+        for i in 0..10 {
+            let guard = pinned.collector.guard();
+            pinned.insert(1, "a", &guard);
+            pinned.insert(2, "b", &guard);
+            assert_eq!(pinned.get(&1, &guard), Some(&"a"));
+            assert_eq!(pinned.get(&2, &guard), Some(&"b"));
+            assert_eq!(pinned.get(&3, &guard), None);
+
+            assert_eq!(pinned.remove(&2, &guard), Some(&"b"));
+            assert_eq!(pinned.remove(&2, &guard), None);
+
+            for i in 0..10000 {
+                pinned.insert(i, "a", &guard);
+            }
+
+            for i in 0..10000 {
+                assert_eq!(pinned.get(&i, &guard), Some(&"a"));
+            }
+
+            pinned.clear(&guard);
+
+            // assert!([
+            //     pinned.iter().count(),
+            //     pinned.len(),
+            //     pinned.iter().size_hint().0,
+            //     pinned.iter().size_hint().1.unwrap()
+            // ]
+            // .iter()
+            // .all(|&l| l == 10000));
+        }
+
+        drop(pinned);
     }
 }

@@ -1,4 +1,4 @@
-#![deny(rust_2018_idioms, clippy::all, unsafe_op_in_unsafe_fn)]
+#![deny(rust_2018_idioms, clippy::all, unsafe_op_in_unsafe_fn, unused_unsafe)]
 #![allow(unused_unsafe)]
 
 // mod pinned;
