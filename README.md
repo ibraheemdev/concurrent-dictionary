@@ -1,3 +1,1 @@
-# Seize
-
-A concurrent HashMap optimized for read-heavy workloads.
+A port of C#'s `ConcurrentDictionary` to Rust.
